@@ -57,7 +57,19 @@ void fpga_pick_copy(const uint8_t *frame)
     fpga_present(frame);
 }
 
+int fpga_setup_dma(uint8_t *const bufs[], int n)
+{
+    (void)bufs;
+    (void)n;
+    return -1;
+}
+
 #else
+
+#include "fbdma.h"
+
+static struct fbdma dma;
+static int use_dma;
 
 static int mem_fd = -1;
 static void *fb_map, *status_map;
@@ -82,7 +94,8 @@ int fpga_open(void)
         close(mem_fd);
         return -1;
     }
-    status_map = mmap(NULL, page_size, PROT_READ, MAP_SHARED, mem_fd, STATUS_BASE);
+    /* writable: the DMA's registers share this page */
+    status_map = mmap(NULL, page_size, PROT_READ | PROT_WRITE, MAP_SHARED, mem_fd, STATUS_BASE);
     if (status_map == MAP_FAILED) {
         perror("mmap status");
         munmap(fb_map, SCREEN_SIZE);
@@ -147,8 +160,34 @@ static void copy_neon(const uint8_t *frame)
 #endif
 }
 
+int fpga_setup_dma(uint8_t *const bufs[], int n)
+{
+    int i;
+
+    if (fbdma_probe(&dma, (volatile uint32_t *)status_map) < 0) {
+        printf("frame DMA: not in this FPGA bitstream, the CPU copies frames\n");
+        return -1;
+    }
+    for (i = 0; i < n; i++) {
+        if (fbdma_register(&dma, bufs[i], SCREEN_SIZE) < 0) {
+            printf("frame DMA: cannot use buffer %d, the CPU copies frames\n", i);
+            return -1;
+        }
+    }
+    use_dma = 1;
+    return 0;
+}
+
 void fpga_present(const uint8_t *frame)
 {
+    if (use_dma) {
+        int i = fbdma_index(&dma, frame);
+
+        if (i >= 0 && fbdma_copy(&dma, i) == 0)
+            return;
+        fprintf(stderr, "frame DMA failed; the CPU copies frames from now on\n");
+        use_dma = 0;
+    }
     if (copy_method == 1)
         copy_neon(frame);
     else
@@ -175,6 +214,27 @@ void fpga_pick_copy(const uint8_t *frame)
         }
     }
     copy_method = best[1] < best[0] ? 1 : 0;
+    if (use_dma) {
+        double dbest = 1e9;
+        int i = fbdma_index(&dma, frame);
+
+        for (r = 0; r < 3 && i >= 0; r++) {
+            double t0 = now_ms(), dt;
+
+            if (fbdma_copy(&dma, i) < 0) {
+                use_dma = 0;
+                break;
+            }
+            dt = now_ms() - t0;
+            if (dt < dbest)
+                dbest = dt;
+        }
+        if (use_dma) {
+            printf("frame copy: %s %.2f ms, %s %.2f ms, FPGA DMA %.2f ms -> using FPGA DMA\n",
+                   name[0], best[0], name[1], best[1], dbest);
+            return;
+        }
+    }
     printf("frame copy: %s %.2f ms, %s %.2f ms -> using %s\n",
            name[0], best[0], name[1], best[1], name[copy_method]);
 }

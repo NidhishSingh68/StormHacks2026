@@ -4,6 +4,8 @@
 // Altera-FPGA-top-level-files), so that script assigns every pin used here.
 //
 //   HPS writes pixels  -> 0xC0000000 .. 0xC004AFFF  (fb_ram, 640x480 RGB332)
+//   or the frame DMA copies them from DDR (registers at 0xFF200100 / 0x200;
+//   its reads go through acp_read_adapter, see there)
 //   HPS reads status   <- 0xFF200000                (vga_frame PIO)
 //                           [31]   1 while in vertical blanking
 //                           [30:0] frames completed (increments on vblank)
@@ -103,6 +105,26 @@ module DE1_SoC_top (
     wire        vblank;
     reg  [31:0] frame_status;
 
+    // frame DMA read path: Avalon from the DMA, coherent AXI to the HPS
+    wire        sys_clk;
+    wire [31:0] dma_address;
+    wire        dma_read, dma_waitrequest, dma_readdatavalid;
+    wire [2:0]  dma_burstcount;
+    wire [7:0]  dma_byteenable;
+    wire [63:0] dma_readdata;
+
+    wire [7:0]  ax_arid, ax_awid, ax_wid, ax_wstrb;
+    wire [31:0] ax_araddr, ax_awaddr;
+    wire [3:0]  ax_arlen, ax_arcache, ax_awlen, ax_awcache;
+    wire [2:0]  ax_arsize, ax_arprot, ax_awsize, ax_awprot;
+    wire [1:0]  ax_arburst, ax_arlock, ax_awburst, ax_awlock;
+    wire [4:0]  ax_aruser, ax_awuser;
+    wire        ax_arvalid, ax_arready, ax_rvalid, ax_rready, ax_rlast;
+    wire        ax_awvalid, ax_awready, ax_wlast, ax_wvalid, ax_wready, ax_bready, ax_bvalid;
+    wire [63:0] ax_rdata, ax_wdata;
+    wire [7:0]  ax_rid, ax_bid;
+    wire [1:0]  ax_rresp, ax_bresp;
+
     soc_system u0 (
         .clk_clk                          (CLOCK_50),
         .reset_reset_n                    (1'b1),
@@ -117,6 +139,30 @@ module DE1_SoC_top (
         .fb_s2_writedata                  (64'd0),
         .fb_s2_byteenable                 (8'hFF),
         .vga_frame_export                 (frame_status),
+
+        .sys_clk_clk                      (sys_clk),
+        .dma_rd_address                   (dma_address),
+        .dma_rd_read                      (dma_read),
+        .dma_rd_byteenable                (dma_byteenable),
+        .dma_rd_readdata                  (dma_readdata),
+        .dma_rd_waitrequest               (dma_waitrequest),
+        .dma_rd_readdatavalid             (dma_readdatavalid),
+        .dma_rd_burstcount                (dma_burstcount),
+
+        .f2h_axi_awid    (ax_awid),    .f2h_axi_awaddr  (ax_awaddr),  .f2h_axi_awlen   (ax_awlen),
+        .f2h_axi_awsize  (ax_awsize),  .f2h_axi_awburst (ax_awburst), .f2h_axi_awlock  (ax_awlock),
+        .f2h_axi_awcache (ax_awcache), .f2h_axi_awprot  (ax_awprot),  .f2h_axi_awvalid (ax_awvalid),
+        .f2h_axi_awready (ax_awready), .f2h_axi_awuser  (ax_awuser),
+        .f2h_axi_wid     (ax_wid),     .f2h_axi_wdata   (ax_wdata),   .f2h_axi_wstrb   (ax_wstrb),
+        .f2h_axi_wlast   (ax_wlast),   .f2h_axi_wvalid  (ax_wvalid),  .f2h_axi_wready  (ax_wready),
+        .f2h_axi_bid     (ax_bid),     .f2h_axi_bresp   (ax_bresp),   .f2h_axi_bvalid  (ax_bvalid),
+        .f2h_axi_bready  (ax_bready),
+        .f2h_axi_arid    (ax_arid),    .f2h_axi_araddr  (ax_araddr),  .f2h_axi_arlen   (ax_arlen),
+        .f2h_axi_arsize  (ax_arsize),  .f2h_axi_arburst (ax_arburst), .f2h_axi_arlock  (ax_arlock),
+        .f2h_axi_arcache (ax_arcache), .f2h_axi_arprot  (ax_arprot),  .f2h_axi_arvalid (ax_arvalid),
+        .f2h_axi_arready (ax_arready), .f2h_axi_aruser  (ax_aruser),
+        .f2h_axi_rid     (ax_rid),     .f2h_axi_rdata   (ax_rdata),   .f2h_axi_rresp   (ax_rresp),
+        .f2h_axi_rlast   (ax_rlast),   .f2h_axi_rvalid  (ax_rvalid),  .f2h_axi_rready  (ax_rready),
 
         .memory_mem_a                     (HPS_DDR3_ADDR),
         .memory_mem_ba                    (HPS_DDR3_BA),
@@ -189,6 +235,25 @@ module DE1_SoC_top (
         .hps_io_hps_io_i2c0_inst_SCL      (HPS_I2C1_SCLK),
         .hps_io_hps_io_i2c1_inst_SDA      (HPS_I2C2_SDAT),
         .hps_io_hps_io_i2c1_inst_SCL      (HPS_I2C2_SCLK)
+    );
+
+    acp_read_adapter u_acp (
+        .clk               (sys_clk),
+        .avm_address       (dma_address),
+        .avm_read          (dma_read),
+        .avm_burstcount    (dma_burstcount),
+        .avm_readdata      (dma_readdata),
+        .avm_waitrequest   (dma_waitrequest),
+        .avm_readdatavalid (dma_readdatavalid),
+        .arid (ax_arid), .araddr (ax_araddr), .arlen (ax_arlen), .arsize (ax_arsize),
+        .arburst (ax_arburst), .arlock (ax_arlock), .arcache (ax_arcache), .arprot (ax_arprot),
+        .aruser (ax_aruser), .arvalid (ax_arvalid), .arready (ax_arready),
+        .rdata (ax_rdata), .rvalid (ax_rvalid), .rready (ax_rready),
+        .awid (ax_awid), .awaddr (ax_awaddr), .awlen (ax_awlen), .awsize (ax_awsize),
+        .awburst (ax_awburst), .awlock (ax_awlock), .awcache (ax_awcache), .awprot (ax_awprot),
+        .awuser (ax_awuser), .awvalid (ax_awvalid),
+        .wid (ax_wid), .wdata (ax_wdata), .wstrb (ax_wstrb), .wlast (ax_wlast), .wvalid (ax_wvalid),
+        .bready (ax_bready)
     );
 
     // ---- VGA scanout (pixel clock domain) ------------------------------------

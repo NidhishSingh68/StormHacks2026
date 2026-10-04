@@ -1083,7 +1083,7 @@ int main(int argc, char **argv)
         return 1;
     render_init(world_render_dist());
     for (i = 0; i < 2; i++) {
-        back[i] = aligned_alloc(64, SCREEN_SIZE);
+        back[i] = aligned_alloc(4096, SCREEN_SIZE);     /* page aligned, for the DMA */
         if (!back[i])
             return 1;
         memset(back[i], 0, SCREEN_SIZE);
@@ -1096,6 +1096,7 @@ int main(int argc, char **argv)
             return 1;
         signal(SIGINT, on_signal);
         signal(SIGTERM, on_signal);
+        fpga_setup_dma(back, 2);        /* the FPGA fetches frames itself, if it can */
         fpga_pick_copy(back[0]);        /* also clears the screen */
         play(autopilot, weather);
         fpga_close();

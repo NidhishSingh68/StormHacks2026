@@ -20,6 +20,12 @@ int      fpga_open(void);
 void     fpga_close(void);
 uint32_t fpga_status(void);
 
+/*
+ * Let the FPGA's DMA engine copy these frame buffers (page aligned,
+ * SCREEN_SIZE bytes each), if the bitstream has one. Returns 0 if it will.
+ */
+int      fpga_setup_dma(uint8_t *const bufs[], int n);
+
 /* Copy a full frame (SCREEN_SIZE bytes, 64-byte aligned) to the FPGA. */
 void     fpga_present(const uint8_t *frame);
 

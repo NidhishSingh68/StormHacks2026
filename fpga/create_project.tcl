@@ -9,6 +9,7 @@ set_global_assignment -name PROJECT_OUTPUT_DIRECTORY output_files
 set_global_assignment -name QIP_FILE        soc_system/synthesis/soc_system.qip
 set_global_assignment -name VERILOG_FILE    DE1_SoC_top.v
 set_global_assignment -name VERILOG_FILE    vga_fb.v
+set_global_assignment -name VERILOG_FILE    acp_read_adapter.v
 set_global_assignment -name SDC_FILE        DE1_SoC_top.sdc
 
 # Board pinout (device, locations, I/O standards)
