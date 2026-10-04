@@ -1,7 +1,7 @@
 /*
  * framebuffer.c - write frames from the DE1-SoC HPS into the FPGA framebuffer
  *
- * The FPGA design (fpga/) holds a 640x480, 8-bit-per-pixel framebuffer in
+ * The FPGA design (../fpga/) holds a 640x480, 8-bit-per-pixel framebuffer in
  * on-chip RAM behind the HPS-to-FPGA (heavy) bridge, and scans it out to the
  * VGA connector continuously:
  *
@@ -33,7 +33,7 @@
  *       -Wall -static framebuffer.c -o framebuffer
  *
  * Run on the board, after the FPGA has been configured with this design
- * (fpga/output_files/soc_system.rbf as the SD card's soc_system.rbf, or
+ * (../fpga/output_files/soc_system.rbf as the SD card's soc_system.rbf, or
  * DE1_SoC_top.sof over JTAG):
  *   sudo ./framebuffer            interactive demo
  *   sudo ./framebuffer -p         write one static test pattern and exit
