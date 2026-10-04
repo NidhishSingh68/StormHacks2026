@@ -7,8 +7,8 @@
 #   ./run.sh none            no board: UI only
 #
 # Every place picked in the UI is turned into a world and sent to the board,
-# where terrad restarts the game on it (install terrad on the board once:
-# sudo sh install_terrad.sh).
+# where terrad restarts the game on it (install terrad on the board once,
+# see ../de1soc/README.md).
 cd "$(dirname "$0")" || exit 1
 
 PY=./venv/bin/python
