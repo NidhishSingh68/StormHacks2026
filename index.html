@@ -1,0 +1,868 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Block World</title>
+<style>
+  :root {
+    box-sizing: border-box;
+    padding-top: env(safe-area-inset-top, 0px);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: #0f1115; color: #e8eaee;
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    display: flex; flex-direction: column; align-items: center;
+    gap: 10px; padding: 14px;
+  }
+  h1 { font-size: 17px; font-weight: 500; margin: 0; letter-spacing: .3px; }
+
+  #stage {
+    position: relative; width: 100%; max-width: 980px; aspect-ratio: 4 / 3;
+    border: 1px solid #2c323c; border-radius: 10px; overflow: hidden;
+    background: #000;
+  }
+  canvas#screen {
+    display: block; width: 100%; height: 100%;
+    image-rendering: pixelated; image-rendering: crisp-edges;
+  }
+
+  /* ---- heads-up display ---- */
+  .overlay { position: absolute; pointer-events: none; }
+  #crosshair {
+    left: 50%; top: 50%; width: 20px; height: 20px;
+    transform: translate(-50%,-50%); mix-blend-mode: difference;
+  }
+  #crosshair::before, #crosshair::after { content:""; position:absolute; background:#fff; }
+  #crosshair::before { left:50%; top:0; width:2px; height:100%; margin-left:-1px; }
+  #crosshair::after  { top:50%; left:0; height:2px; width:100%; margin-top:-1px; }
+
+  #compass {
+    top: 10px; left: 50%; transform: translateX(-50%);
+    background: rgba(0,0,0,.45); border: 1px solid rgba(255,255,255,.14);
+    border-radius: 5px; padding: 3px 16px;
+    font: 13px ui-monospace, monospace; letter-spacing: 2px;
+    text-shadow: 0 1px 2px #000;
+  }
+  #minimap {
+    top: 10px; right: 10px; width: 136px; height: 136px;
+    border: 2px solid rgba(255,255,255,.22); border-radius: 4px;
+    image-rendering: pixelated; background: #000;
+  }
+  #stats {
+    top: 10px; left: 10px; font: 12px/1.6 ui-monospace, monospace;
+    text-shadow: 0 1px 2px #000; color: #dfe4ea;
+  }
+
+  /* ---- hotbar: the row of block slots along the bottom ---- */
+  #hotbar {
+    bottom: 10px; left: 50%; transform: translateX(-50%);
+    display: flex; gap: 3px; padding: 3px;
+    background: rgba(0,0,0,.45); border: 2px solid rgba(255,255,255,.18);
+    border-radius: 4px;
+  }
+  .slot {
+    width: 38px; height: 38px; border: 2px solid rgba(255,255,255,.12);
+    display: flex; align-items: flex-end; justify-content: center;
+    font: 9px ui-monospace, monospace; color: rgba(255,255,255,.85);
+    text-shadow: 0 1px 2px #000; padding-bottom: 2px;
+  }
+  .slot.on { border-color: #fff; box-shadow: 0 0 0 1px #000 inset; }
+
+  #toast {
+    left: 50%; bottom: 62px; transform: translateX(-50%);
+    font: 14px/1.4 system-ui; text-shadow: 0 1px 3px #000;
+    opacity: 0; transition: opacity .4s;
+  }
+  #toast.show { opacity: 1; }
+
+  #lockmsg {
+    inset: 0; display: flex; align-items: center; justify-content: center;
+    background: rgba(8,10,14,.55); font-size: 15px; letter-spacing: .4px;
+    cursor: pointer; pointer-events: auto;
+  }
+  #lockmsg.hidden { display: none; }
+
+  #drop {
+    position: absolute; inset: 0; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 12px;
+    background: rgba(8,10,14,.95); text-align: center; padding: 24px;
+  }
+  #drop.hidden { display: none; }
+
+  .panel {
+    width: 100%; max-width: 980px; background: #171a21;
+    border: 1px solid #2c323c; border-radius: 10px; padding: 12px 14px;
+  }
+  .row { display: flex; flex-wrap: wrap; gap: 14px 20px; align-items: center; }
+  label { font-size: 13px; color: #98a2b2; display: flex; gap: 8px; align-items: center; }
+  input[type=range] { width: 130px; }
+  select, button {
+    background: #262c38; color: #e8eaee; border: 1px solid #39414f;
+    border-radius: 6px; padding: 6px 11px; font-size: 13px; cursor: pointer;
+  }
+  button:hover { background: #30384a; }
+  kbd {
+    background: #262c38; border: 1px solid #39414f; border-radius: 4px;
+    padding: 1px 5px; font: 12px ui-monospace, monospace;
+  }
+  p { margin: 10px 0 0; font-size: 13px; color: #98a2b2; line-height: 1.9; }
+</style>
+</head>
+<body>
+
+<h1>Block World</h1>
+
+<div id="stage">
+  <canvas id="screen" width="320" height="240"></canvas>
+  <div class="overlay" id="crosshair"></div>
+  <div class="overlay" id="compass">N</div>
+  <canvas class="overlay" id="minimap" width="128" height="128"></canvas>
+  <div class="overlay" id="stats"></div>
+  <div class="overlay" id="hotbar"></div>
+  <div class="overlay" id="toast"></div>
+  <div class="overlay" id="lockmsg">click to play &nbsp;·&nbsp; esc to release the mouse</div>
+  <div id="drop">
+    <strong style="font-size:16px">Drop <code>world.bin</code> here</strong>
+    <div style="color:#98a2b2;font-size:13px">or</div>
+    <button id="pick">Choose file…</button>
+    <input id="file" type="file" accept=".bin" hidden>
+    <div style="color:#6d7685;font-size:12px">16384 bytes, made by worldgen.py</div>
+  </div>
+</div>
+
+<div class="panel">
+  <div class="row">
+    <label>Terrain height <input id="scale" type="range" min="30" max="220" value="110"></label>
+    <label>View distance <input id="dist" type="range" min="20" max="140" value="100"></label>
+    <label>Field of view <input id="fov" type="range" min="35" max="95" value="60"></label>
+    <label>Resolution
+      <select id="res">
+        <option value="160">160 × 120 (chunky)</option>
+        <option value="256">256 × 192</option>
+        <option value="320" selected>320 × 240</option>
+        <option value="480">480 × 360</option>
+      </select>
+    </label>
+    <button id="viewBtn">View: first person</button>
+    <button id="shot">Save PNG</button>
+  </div>
+  <p>
+    <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> walk &nbsp;
+    <kbd>Space</kbd> jump &nbsp;
+    <kbd>Ctrl</kbd> sprint &nbsp;
+    <kbd>Shift</kbd> sneak &nbsp;
+    <kbd>F5</kbd> or <kbd>V</kbd> change view &nbsp;
+    <kbd>1</kbd>–<kbd>8</kbd> pick a block &nbsp;
+    <kbd>F</kbd> fly &nbsp;
+    mouse to look
+  </p>
+</div>
+
+<script>
+/* ===========================================================================
+ * Block world engine - the Minecraft-style renderer
+ * ===========================================================================
+ * World format (identical to worldgen.py, render.c and renderer.v):
+ *   16384 bytes, one per cell, byte = (height << 3) | blockType
+ *   address = y * 128 + x,  row 0 = north, column 0 = west
+ * =========================================================================== */
+
+const GRID = 128;
+
+/* Each block has a top colour and a side colour. Real Minecraft blocks are
+ * lit per face: the top catches the sky, the sides are darker. Baking two
+ * colours per block instead of dimming one is what makes a cube read as a
+ * cube rather than a flat sticker. */
+const BLOCKS = [
+  { name: "water",  top: [ 48, 108, 180], side: [ 36,  86, 150], tex: 3  },
+  { name: "grass",  top: [106, 164,  66], side: [122,  92,  58], tex: 10 },
+  { name: "sand",   top: [222, 204, 146], side: [206, 188, 132], tex: 8  },
+  { name: "stone",  top: [136, 136, 140], side: [118, 118, 122], tex: 12 },
+  { name: "snow",   top: [246, 250, 255], side: [222, 230, 240], tex: 5  },
+  { name: "forest", top: [ 56, 112,  62], side: [ 82,  62,  42], tex: 14 },
+  { name: "city",   top: [168, 148, 142], side: [140, 124, 118], tex: 16 },
+  { name: "dirt",   top: [146, 110,  74], side: [132,  98,  64], tex: 11 },
+];
+
+/* Sky: a gradient, not a flat colour. Minecraft's sky is pale at the horizon
+ * and deeper overhead, and that alone makes distance read correctly. */
+const SKY_HIGH = [ 92, 148, 226];
+const SKY_LOW  = [168, 206, 240];
+
+/* Faces pointing different ways get different brightness. This is the single
+ * biggest reason Minecraft terrain looks three-dimensional. */
+const LIGHT_TOP   = 1.00;
+const LIGHT_X     = 0.78;   // faces looking east or west
+const LIGHT_Y     = 0.62;   // faces looking north or south
+const EDGE_DARK    = 0.82;  // the dark line between stacked cubes
+
+function cellAt(world, x, y) {
+  if (x < 0) x = 0; else if (x >= GRID) x = GRID - 1;
+  if (y < 0) y = 0; else if (y >= GRID) y = GRID - 1;
+  return world[y * GRID + x];
+}
+const cellHeight = (w, x, y) => cellAt(w, x, y) >> 3;
+const cellBlock  = (w, x, y) => cellAt(w, x, y) & 7;
+
+/* A cheap repeatable hash. Same cell always gets the same speckle, so the
+ * texture does not crawl as you walk. This is a handful of XORs and shifts,
+ * which is nothing in hardware either. */
+function hash3(x, y, z) {
+  let h = (x * 374761393 + y * 668265263 + z * 2147483647) | 0;
+  h = (h ^ (h >> 13)) * 1274126177 | 0;
+  return ((h ^ (h >> 16)) & 255) / 255;
+}
+
+/* ---------------------------------------------------------------------------
+ * renderFrame - draws one frame into an RGBA buffer
+ *
+ * Same walk as render.c: for each screen column, step outward from the
+ * camera, and paint upward whenever a cell pokes above everything painted so
+ * far. What is new is what happens INSIDE the painted strip: instead of one
+ * flat colour, each screen pixel is turned back into a world height, so we
+ * know which cube of the stack it belongs to. That lets us draw the dark line
+ * between cubes and give each cube its own speckle.
+ * ------------------------------------------------------------------------- */
+function renderFrame(world, px, W, H, cam, opts) {
+  const SCALE   = opts.scale;
+  const VIEW    = opts.viewDist;
+  const FOV     = opts.fov;
+  const HORIZON = opts.horizon;
+  const time    = opts.time || 0;
+
+  // ---- sky ---------------------------------------------------------------
+  for (let sy = 0; sy < H; sy++) {
+    // Pale near the horizon, deeper higher up.
+    let t = (sy - (HORIZON - H)) / H;
+    t = t < 0 ? 0 : t > 1 ? 1 : t;
+    const r = SKY_HIGH[0] + (SKY_LOW[0] - SKY_HIGH[0]) * t;
+    const g = SKY_HIGH[1] + (SKY_LOW[1] - SKY_HIGH[1]) * t;
+    const b = SKY_HIGH[2] + (SKY_LOW[2] - SKY_HIGH[2]) * t;
+    for (let sx = 0; sx < W; sx++) {
+      const i = (sy * W + sx) * 4;
+      px[i] = r; px[i + 1] = g; px[i + 2] = b; px[i + 3] = 255;
+    }
+  }
+
+  const camX = cam.x, camY = cam.y, camZ = cam.z;
+  const a    = cam.angle * Math.PI / 180;
+  const fwdX = Math.cos(a), fwdY = -Math.sin(a);
+  const rgtX = -fwdY,       rgtY =  fwdX;
+
+  for (let sx = 0; sx < W; sx++) {
+    const off  = (sx / W - 0.5) * 2 * FOV;
+    const dirX = fwdX + rgtX * off;
+    const dirY = fwdY + rgtY * off;
+
+    // Which way does the face we can see point? Whichever axis the ray is
+    // travelling along faster is the axis we are looking into.
+    const sideLight = Math.abs(dirX) > Math.abs(dirY) ? LIGHT_X : LIGHT_Y;
+
+    let highest = H;
+
+    for (let step = 1; step <= VIEW; step++) {
+      const wx = camX + dirX * step;
+      const wy = camY + dirY * step;
+      const cx = Math.floor(wx), cy = Math.floor(wy);
+      if (cx < 0 || cx >= GRID || cy < 0 || cy >= GRID) break;
+
+      let h = cellHeight(world, cx, cy);
+      const bt = cellBlock(world, cx, cy);
+      const blk = BLOCKS[bt];
+
+      // Water ripples: a slow wave on the surface height. Cheap, and the
+      // movement is what sells it as liquid rather than blue rock.
+      if (bt === 0) h += 0.12 * Math.sin(time * 1.6 + cx * 0.7 + cy * 0.5);
+
+      const topY = HORIZON + (camZ - h) * SCALE / step;
+      const topYi = Math.round(topY);
+
+      if (topYi < highest) {
+        // Distance fog, toward the sky colour at the horizon.
+        const fog = Math.min(0.82, (step / VIEW) * 0.9);
+        const fogR = SKY_LOW[0], fogG = SKY_LOW[1], fogB = SKY_LOW[2];
+
+        const from = topYi < 0 ? 0 : topYi;
+        const to   = highest > H ? H : highest;
+
+        for (let sy = from; sy < to; sy++) {
+          let cr, cg, cb, light;
+
+          if (sy === topYi) {
+            // ---- the flat top of the block --------------------------------
+            const n = hash3(cx, cy, 7) * blk.tex - blk.tex / 2;
+            cr = blk.top[0] + n; cg = blk.top[1] + n; cb = blk.top[2] + n;
+            light = LIGHT_TOP;
+          } else {
+            // ---- the side: work out which cube of the stack this is -------
+            const worldZ = camZ - (sy - HORIZON) * step / SCALE;
+            const level  = Math.floor(worldZ);
+            const frac   = worldZ - level;
+
+            const n = hash3(cx * 3 + 1, cy * 3 + 2, level) * blk.tex - blk.tex / 2;
+            cr = blk.side[0] + n; cg = blk.side[1] + n; cb = blk.side[2] + n;
+
+            light = sideLight;
+            // The dark seam where one cube sits on the next.
+            if (frac > 0.90 || frac < 0.055) light *= EDGE_DARK;
+          }
+
+          const i = (sy * W + sx) * 4;
+          px[i]     = (cr * light) * (1 - fog) + fogR * fog;
+          px[i + 1] = (cg * light) * (1 - fog) + fogG * fog;
+          px[i + 2] = (cb * light) * (1 - fog) + fogB * fog;
+          px[i + 3] = 255;
+        }
+        highest = topYi;
+      }
+      if (highest <= 0) break;
+    }
+  }
+}
+
+/* ---- spawn + facing (same rules as render.c) ----------------------------- */
+function defaultSpawn(world) {
+  let bx = GRID >> 1, by = GRID >> 1, best = 1e9;
+  for (let y = 6; y < GRID - 6; y++) {
+    for (let x = 6; x < GRID - 6; x++) {
+      if (cellBlock(world, x, y) === 0) continue;
+      const h = cellHeight(world, x, y);
+      let slope = 0;
+      slope = Math.max(slope, Math.abs(cellHeight(world, x + 1, y) - h));
+      slope = Math.max(slope, Math.abs(cellHeight(world, x - 1, y) - h));
+      slope = Math.max(slope, Math.abs(cellHeight(world, x, y + 1) - h));
+      slope = Math.max(slope, Math.abs(cellHeight(world, x, y - 1) - h));
+      if (slope > 2) continue;
+      const dx = x - GRID / 2, dy = y - GRID / 2;
+      const d = dx * dx + dy * dy;
+      if (d < best) { best = d; bx = x; by = y; }
+    }
+  }
+  return [bx + 0.5, by + 0.5];
+}
+
+function defaultAngle(world, cx, cy) {
+  let bestAngle = 0, bestScore = 1e9;
+  for (let i = 0; i < 16; i++) {
+    const deg = i * 22.5, a = deg * Math.PI / 180;
+    const dx = Math.cos(a), dy = -Math.sin(a);
+    let sum = 0, n = 0;
+    for (let step = 1; step <= 14; step++) {
+      const x = (cx + dx * step) | 0, y = (cy + dy * step) | 0;
+      if (x < 0 || x >= GRID || y < 0 || y >= GRID) break;
+      sum += cellHeight(world, x, y); n++;
+    }
+    if (!n) continue;
+    if (sum / n < bestScore) { bestScore = sum / n; bestAngle = deg; }
+  }
+  return bestAngle;
+}
+
+if (typeof module !== "undefined") {
+  module.exports = { GRID, BLOCKS, renderFrame, defaultSpawn, defaultAngle,
+                     cellHeight, cellBlock, hash3 };
+}
+
+/* ===========================================================================
+ * THE PLAYER  --  movement that feels like Minecraft
+ * ===========================================================================
+ * The things that actually make it feel right, in order of how much they
+ * matter: momentum rather than teleporting, gravity and jumping, stepping up
+ * a single block without jumping, and the head bobbing as you walk.
+ * =========================================================================== */
+
+const EYE_STAND  = 1.72;    // blocks above the feet
+const EYE_SNEAK  = 1.35;
+const GRAVITY    = 26;      // blocks per second per second
+const JUMP_SPEED  = 7.4;
+const WALK_SPEED  = 4.6;    // blocks per second
+const SPRINT_MULT = 1.75;
+const SNEAK_MULT  = 0.38;
+/* One cell is 30 m of real ground and one height level is tens of metres, so
+ * a "step" here is really a hillside. Testing showed 1 block boxes the player
+ * into a tiny pocket of the map; 3 blocks more than doubles where you can go
+ * while still stopping you walking up a cliff face. */
+const STEP_UP     = 3.0;    // how steep a slope you can walk straight up
+const ACCEL       = 14;     // how fast you reach full speed
+const FRICTION    = 11;
+
+const player = {
+  x: 64.5, y: 64.5,
+  feetZ: 0,           // height of the feet, in blocks
+  vz: 0,              // vertical speed
+  vx: 0, vy: 0,       // horizontal speed, in world units
+  yaw: 45,            // degrees, 0 = east
+  pitch: 0,           // degrees, + is up
+  onGround: true,
+  inWater: false,
+  flying: false,      // F toggles: no gravity, walk through anything
+  bob: 0,             // head bob phase
+  walkPhase: 0,       // arm and leg swing for the third-person figure
+  moving: false,
+};
+
+/* Is this spot somewhere the player can be? Water counts, because you wade
+ * into it rather than bouncing off it. */
+function solidTop(world, x, y) {
+  const cx = x | 0, cy = y | 0;
+  if (cx < 1 || cx >= GRID - 1 || cy < 1 || cy >= GRID - 1) return null;
+  return cellHeight(world, cx, cy);
+}
+
+/* Try to move to (nx, ny). Returns the height to stand at, or null if the
+ * step up is too big. */
+function tryMove(world, nx, ny, feetZ) {
+  const top = solidTop(world, nx, ny);
+  if (top === null) return null;                 // off the map
+  if (top <= feetZ + STEP_UP) return top;        // flat, downhill, or a step
+  return null;                                   // a wall
+}
+
+function updatePlayer(world, dt, keys, opts) {
+  const a  = player.yaw * Math.PI / 180;
+  const fx = Math.cos(a), fy = -Math.sin(a);
+
+  // ---- fly mode: for showing the world off, and for getting unstuck -----
+  if (player.flying) {
+    const spd = (keys["control"] ? 26 : 11);
+    let wx = 0, wy = 0;
+    if (keys["w"]) { wx += fx; wy += fy; }
+    if (keys["s"]) { wx -= fx; wy -= fy; }
+    if (keys["d"]) { wx -= fy; wy += fx; }
+    if (keys["a"]) { wx += fy; wy -= fx; }
+    const l = Math.hypot(wx, wy);
+    player.moving = l > 0.01;
+    if (player.moving) { wx /= l; wy /= l; }
+    player.x = Math.max(1, Math.min(GRID - 1.001, player.x + wx * spd * dt));
+    player.y = Math.max(1, Math.min(GRID - 1.001, player.y + wy * spd * dt));
+    if (keys[" "])     player.feetZ += spd * 0.6 * dt;
+    if (keys["shift"]) player.feetZ -= spd * 0.6 * dt;
+    player.feetZ = Math.max(0, Math.min(60, player.feetZ));
+    player.vx = player.vy = player.vz = 0;
+    player.onGround = false;
+    if (player.moving) player.walkPhase += dt * 6;
+    player.yaw = ((player.yaw % 360) + 360) % 360;
+    player.pitch = Math.max(-62, Math.min(62, player.pitch));
+    return;
+  }
+
+  // ---- which way is the player asking to go? ----------------------------
+  let wishX = 0, wishY = 0;
+  if (keys["w"]) { wishX += fx; wishY += fy; }
+  if (keys["s"]) { wishX -= fx; wishY -= fy; }
+  if (keys["d"]) { wishX -= fy; wishY += fx; }
+  if (keys["a"]) { wishX += fy; wishY -= fx; }
+
+  const len = Math.hypot(wishX, wishY);
+  player.moving = len > 0.01;
+  if (player.moving) { wishX /= len; wishY /= len; }
+
+  const sneaking = !!keys["shift"];
+  const sprinting = (keys["control"] || keys["ctrl"]) && !sneaking;
+  let speed = WALK_SPEED * (sprinting ? SPRINT_MULT : 1) * (sneaking ? SNEAK_MULT : 1);
+  if (player.inWater) speed *= 0.55;             // wading is slow
+
+  // ---- accelerate toward that, and rub off speed when they let go -------
+  const grip = player.onGround ? 1 : 0.35;       // less control in mid air
+  player.vx += (wishX * speed - player.vx) * Math.min(1, ACCEL * grip * dt);
+  player.vy += (wishY * speed - player.vy) * Math.min(1, ACCEL * grip * dt);
+  if (!player.moving) {
+    const drop = Math.max(0, 1 - FRICTION * dt * grip);
+    player.vx *= drop; player.vy *= drop;
+  }
+
+  // ---- move, sliding along walls instead of sticking to them ------------
+  const nx = player.x + player.vx * dt;
+  const ny = player.y + player.vy * dt;
+
+  let landed = tryMove(world, nx, ny, player.feetZ);
+  if (landed !== null) { player.x = nx; player.y = ny; }
+  else {
+    // Blocked diagonally: try each axis on its own so you slide along the
+    // face instead of stopping dead. This is a small thing that makes a
+    // huge difference to how the controls feel.
+    const onlyX = tryMove(world, nx, player.y, player.feetZ);
+    const onlyY = tryMove(world, player.x, ny, player.feetZ);
+    if (onlyX !== null) { player.x = nx; player.vy = 0; landed = onlyX; }
+    else if (onlyY !== null) { player.y = ny; player.vx = 0; landed = onlyY; }
+    else { player.vx = 0; player.vy = 0; landed = solidTop(world, player.x, player.y); }
+  }
+
+  // ---- gravity, jumping and standing on the ground ----------------------
+  const ground = landed === null ? player.feetZ : landed;
+  const block  = cellBlock(world, player.x | 0, player.y | 0);
+  player.inWater = block === 0;
+
+  if (keys[" "] && player.onGround) {
+    player.vz = JUMP_SPEED * (player.inWater ? 0.6 : 1);
+    player.onGround = false;
+  }
+
+  player.vz -= GRAVITY * (player.inWater ? 0.45 : 1) * dt;
+  player.feetZ += player.vz * dt;
+
+  if (player.feetZ <= ground) {
+    // Landing, or walking up a slope: ease up so steps are not jarring.
+    const gap = ground - player.feetZ;
+    player.feetZ = gap > 0.6 ? ground : player.feetZ + gap * Math.min(1, 16 * dt);
+    if (gap > 0.6) player.feetZ = ground;
+    player.vz = 0;
+    player.onGround = true;
+  } else {
+    player.onGround = false;
+  }
+
+  // ---- head bob and limb swing ------------------------------------------
+  if (player.moving && player.onGround) {
+    const rate = 9 * (sprinting ? 1.5 : 1) * (sneaking ? 0.5 : 1);
+    player.bob += dt * rate;
+    player.walkPhase += dt * rate;
+  } else {
+    player.bob += (0 - (player.bob % (Math.PI * 2))) * 0;   // leave it parked
+  }
+
+  player.yaw = ((player.yaw % 360) + 360) % 360;
+  player.pitch = Math.max(-62, Math.min(62, player.pitch));
+}
+
+/* Where the eye is, including the bob. */
+function eyeHeight() {
+  const base = player.feetZ + EYE_STAND;
+  const bob  = (player.moving && player.onGround)
+             ? Math.sin(player.bob * 2) * 0.055 : 0;
+  return base + bob;
+}
+
+/* ===========================================================================
+ * THE THIRD-PERSON FIGURE
+ * =========================================================================== */
+const SKIN = [226, 174, 136], SHIRT = [ 58, 120, 196], PANTS = [ 48,  56,  92];
+const HAIR = [ 64,  44,  32];
+
+function fillRect(px, W, H, x0, y0, w, h, col, dim) {
+  const xa = Math.max(0, Math.round(x0)), xb = Math.min(W, Math.round(x0 + w));
+  const ya = Math.max(0, Math.round(y0)), yb = Math.min(H, Math.round(y0 + h));
+  for (let y = ya; y < yb; y++) {
+    for (let x = xa; x < xb; x++) {
+      const i = (y * W + x) * 4;
+      px[i]     = col[0] * dim;
+      px[i + 1] = col[1] * dim;
+      px[i + 2] = col[2] * dim;
+      px[i + 3] = 255;
+    }
+  }
+}
+
+/* Draws the figure standing `dist` in front of the camera, dead centre. Uses
+ * the same projection as the terrain so it sits on the ground properly. */
+function drawCharacter(px, W, H, camZ, feetZ, dist, opts, phase, moving, sneak) {
+  const HORIZON = opts.horizon, SCALE = opts.scale;
+  const BODY = sneak ? 1.55 : 1.85;
+
+  const feetY = HORIZON + (camZ - feetZ) * SCALE / dist;
+  const headY = HORIZON + (camZ - (feetZ + BODY)) * SCALE / dist;
+  const tall  = feetY - headY;
+  if (tall < 6 || feetY < -20 || headY > H + 20) return;
+
+  const cx = W / 2, u = tall / 32, dim = 0.95;
+  const swing = moving ? Math.sin(phase * 2) * 4 * u : 0;
+
+  fillRect(px, W, H, cx - 3.2*u + swing, feetY - 12*u, 3*u, 12*u, PANTS, dim*0.78);
+  fillRect(px, W, H, cx + 0.2*u - swing, feetY - 12*u, 3*u, 12*u, PANTS, dim);
+  fillRect(px, W, H, cx - 6.0*u, feetY - 24*u - swing*0.6, 2.7*u, 11*u, SHIRT, dim*0.78);
+  fillRect(px, W, H, cx + 3.3*u, feetY - 24*u + swing*0.6, 2.7*u, 11*u, SHIRT, dim);
+  fillRect(px, W, H, cx - 3.2*u, feetY - 24*u, 6.4*u, 12*u, SHIRT, dim);
+  fillRect(px, W, H, cx - 4.0*u, feetY - 32*u, 8*u, 8*u, SKIN, dim);
+  fillRect(px, W, H, cx - 4.0*u, feetY - 32*u, 8*u, 2.6*u, HAIR, dim);
+}
+
+/* The arm holding a block in the bottom-right, the way Minecraft does it.
+ * It swings with the walk, which is most of why first person feels alive. */
+function drawHand(px, W, H, blockIdx, bobPhase, moving) {
+  const blk = BLOCKS[blockIdx];
+  const sway = moving ? Math.sin(bobPhase * 2) * H * 0.012 : 0;
+  const rise = moving ? Math.abs(Math.cos(bobPhase * 2)) * H * 0.008 : 0;
+
+  const w = W * 0.17, h = H * 0.23;
+  const x = W * 0.70 + sway;
+  const y = H - h + rise * 0.6;
+
+  // held block: a top face and a front face so it reads as a cube
+  fillRect(px, W, H, x, y, w, h * 0.34, blk.top,  1.0);
+  fillRect(px, W, H, x, y + h * 0.34, w, h * 0.5, blk.side, 0.82);
+  // the arm, below and to the right of it
+  fillRect(px, W, H, x + w * 0.52, y + h * 0.62, w * 0.60, h * 0.5, SKIN, 0.9);
+}
+
+/* ---------------------------------------------------------------------------
+ * Third-person camera
+ *
+ * The trap here: if you let the camera climb a hill behind the player to see
+ * over it, the camera ends up far ABOVE the player, and with the projection
+ * we use that pushes the figure hundreds of pixels below the screen. So the
+ * camera stays near the player's own height - roughly chest height - and when
+ * terrain gets in the way it pulls CLOSER instead of higher. That is what
+ * most third-person games actually do.
+ * ------------------------------------------------------------------------- */
+const CAM_HEIGHT  = 1.1;    // above the feet, so roughly chest height
+const CAM_MIN     = 2.2;    // never closer than this, or the figure fills the view
+
+function thirdPersonCamera(world, px_, py_, yaw, back, feetZ) {
+  const a  = yaw * Math.PI / 180;
+  const fx = Math.cos(a), fy = -Math.sin(a);
+  const z  = feetZ + CAM_HEIGHT;
+
+  const buried = d => {
+    const x = px_ - fx * d, y = py_ - fy * d;
+    if (x < 1 || x >= GRID - 1 || y < 1 || y >= GRID - 1) return true;
+    return cellHeight(world, x | 0, y | 0) > z - 0.3;
+  };
+
+  // If even the closest allowed position is inside a hill, there is nowhere
+  // sensible to put the camera. Rather than show the inside of a mountain,
+  // say so and let the caller fall back to first person - which is exactly
+  // what a third-person game does when you back into a wall.
+  if (buried(CAM_MIN)) return { ok: false };
+
+  let dist = CAM_MIN;
+  for (let d = CAM_MIN; d <= back; d += 0.2) {
+    if (buried(d)) break;
+    dist = d;
+  }
+  return { ok: true, x: px_ - fx * dist, y: py_ - fy * dist, z: z, dist: dist };
+}
+
+/* The horizon is the pitch. Shifting it down is looking down.
+ * In third person it is also nudged so the figure stays framed. */
+function horizonFor(H, pitchDeg, extra) {
+  return (H >> 1) + (pitchDeg / 45) * H * 0.55 + (extra || 0);
+}
+
+/* ===========================================================================
+ * BROWSER GLUE  --  input, the main loop, and the HUD
+ * =========================================================================== */
+if (typeof document !== "undefined") {
+  const canvas  = document.getElementById("screen");
+  const ctx     = canvas.getContext("2d", { alpha: false });
+  const mini    = document.getElementById("minimap");
+  const miniCtx = mini.getContext("2d");
+  const compass = document.getElementById("compass");
+  const statsEl = document.getElementById("stats");
+  const hotbar  = document.getElementById("hotbar");
+  const toast   = document.getElementById("toast");
+  const lockmsg = document.getElementById("lockmsg");
+  const drop    = document.getElementById("drop");
+
+  let world = null, img = null, pixels = null, mapImg = null;
+  let W = 320, H = 240;
+  let thirdPerson = false, slot = 1;
+  const keys = Object.create(null);
+  const opts = { scale: 110, viewDist: 100, fov: 0.60, horizon: 120, time: 0 };
+
+  // ---- hotbar ------------------------------------------------------------
+  BLOCKS.forEach((b, i) => {
+    const d = document.createElement("div");
+    d.className = "slot" + (i === slot ? " on" : "");
+    d.style.background = `rgb(${b.top.join(",")})`;
+    d.textContent = i + 1;
+    hotbar.appendChild(d);
+  });
+  function selectSlot(i) {
+    slot = i;
+    [...hotbar.children].forEach((d, n) => d.classList.toggle("on", n === i));
+    showToast(BLOCKS[i].name);
+  }
+  let toastTimer = 0;
+  function showToast(text) {
+    toast.textContent = text;
+    toast.classList.add("show");
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => toast.classList.remove("show"), 1100);
+  }
+
+  function setResolution(w) {
+    W = w; H = Math.round(w * 3 / 4);
+    canvas.width = W; canvas.height = H;
+    img = ctx.createImageData(W, H);
+    pixels = img.data;
+  }
+  setResolution(320);
+
+  // ---- loading a world ---------------------------------------------------
+  function buildMap() {
+    const im = miniCtx.createImageData(GRID, GRID);
+    for (let i = 0; i < GRID * GRID; i++) {
+      const b = world[i], blk = BLOCKS[b & 7], h = (b >> 3) / 31;
+      const shade = 0.5 + 0.7 * h;
+      im.data[i*4]   = Math.min(255, blk.top[0] * shade);
+      im.data[i*4+1] = Math.min(255, blk.top[1] * shade);
+      im.data[i*4+2] = Math.min(255, blk.top[2] * shade);
+      im.data[i*4+3] = 255;
+    }
+    mapImg = im;
+  }
+
+  function loadWorld(buf) {
+    if (buf.byteLength !== GRID * GRID) {
+      drop.innerHTML = `<strong>That is not a world.bin</strong>
+        <div style="color:#98a2b2;font-size:13px">
+        expected ${GRID*GRID} bytes, got ${buf.byteLength}</div>`;
+      return;
+    }
+    world = new Uint8Array(buf);
+    buildMap();
+    const [sx, sy] = defaultSpawn(world);
+    player.x = sx; player.y = sy;
+    player.feetZ = cellHeight(world, sx|0, sy|0);
+    player.vx = player.vy = player.vz = 0;
+    player.yaw = defaultAngle(world, sx, sy);
+    player.pitch = 0;
+    drop.classList.add("hidden");
+  }
+
+  const readFile = f => f.arrayBuffer().then(loadWorld);
+  document.getElementById("pick").onclick = () => document.getElementById("file").click();
+  document.getElementById("file").onchange = e => e.target.files[0] && readFile(e.target.files[0]);
+  ["dragenter","dragover"].forEach(ev => document.addEventListener(ev, e => e.preventDefault()));
+  document.addEventListener("drop", e => {
+    e.preventDefault();
+    if (e.dataTransfer.files[0]) readFile(e.dataTransfer.files[0]);
+  });
+  fetch("world.bin").then(r => r.ok ? r.arrayBuffer() : Promise.reject())
+    .then(loadWorld).catch(() => {});
+
+  // ---- keyboard ----------------------------------------------------------
+  const HELD = ["w","a","s","d"," ","shift","control"];
+  addEventListener("keydown", e => {
+    const k = e.key.toLowerCase();
+    keys[k] = true;
+    if (HELD.includes(k)) e.preventDefault();
+    if (k === "v" || e.key === "F5") { setView(!thirdPerson); e.preventDefault(); }
+    if (k === "f") {
+      player.flying = !player.flying;
+      player.vz = 0;
+      showToast(player.flying ? "fly mode on" : "fly mode off");
+    }
+    if (k >= "1" && k <= "8") selectSlot(+k - 1);
+  });
+  addEventListener("keyup", e => { keys[e.key.toLowerCase()] = false; });
+  addEventListener("blur", () => { for (const k in keys) keys[k] = false; });
+
+  // ---- mouse look --------------------------------------------------------
+  let locked = false;
+  canvas.addEventListener("click", () => canvas.requestPointerLock());
+  lockmsg.addEventListener("click", () => canvas.requestPointerLock());
+  document.addEventListener("pointerlockchange", () => {
+    locked = document.pointerLockElement === canvas;
+    lockmsg.classList.toggle("hidden", locked);
+  });
+  const SENS = 0.14;
+  addEventListener("mousemove", e => {
+    if (!locked) return;
+    player.yaw   -= e.movementX * SENS;
+    player.pitch -= e.movementY * SENS;
+  });
+
+  // ---- controls ----------------------------------------------------------
+  const viewBtn = document.getElementById("viewBtn");
+  function setView(third) {
+    thirdPerson = third;
+    viewBtn.textContent = "View: " + (third ? "third person" : "first person");
+  }
+  viewBtn.onclick = () => setView(!thirdPerson);
+  document.getElementById("scale").oninput = e => opts.scale = +e.target.value;
+  document.getElementById("dist").oninput  = e => opts.viewDist = +e.target.value;
+  document.getElementById("fov").oninput   = e => opts.fov = +e.target.value / 100;
+  document.getElementById("res").onchange  = e => setResolution(+e.target.value);
+  document.getElementById("shot").onclick  = () => {
+    const a = document.createElement("a");
+    a.download = "blockworld.png";
+    a.href = canvas.toDataURL("image/png");
+    a.click();
+  };
+
+  // ---- minimap + compass -------------------------------------------------
+  function drawMinimap() {
+    if (!mapImg) return;
+    miniCtx.putImageData(mapImg, 0, 0);
+    const a = player.yaw * Math.PI / 180;
+    miniCtx.save();
+    miniCtx.translate(player.x, player.y);
+    miniCtx.rotate(-a);
+    miniCtx.fillStyle = "rgba(255,255,255,.26)";
+    miniCtx.beginPath();
+    miniCtx.moveTo(0,0); miniCtx.lineTo(30,-15); miniCtx.lineTo(30,15);
+    miniCtx.closePath(); miniCtx.fill();
+    miniCtx.restore();
+    miniCtx.fillStyle = "#ffe13c"; miniCtx.strokeStyle = "#101010";
+    miniCtx.lineWidth = 1;
+    miniCtx.beginPath(); miniCtx.arc(player.x, player.y, 2.6, 0, 7);
+    miniCtx.fill(); miniCtx.stroke();
+  }
+
+  const DIRS = ["N","NE","E","SE","S","SW","W","NW"];
+  function compassText() {
+    const fromNorth = ((90 - player.yaw) % 360 + 360) % 360;
+    return DIRS[Math.round(fromNorth / 45) % 8] + "  " + fromNorth.toFixed(0) + "\u00B0";
+  }
+
+  // ---- the main loop -----------------------------------------------------
+  let last = performance.now(), fps = 60, frames = 0, acc = 0;
+
+  function tick(now) {
+    const dt = Math.min(0.05, (now - last) / 1000);
+    last = now;
+    opts.time += dt;
+
+    if (world) {
+      updatePlayer(world, dt, keys, opts);
+
+      const eyeZ = eyeHeight();
+      opts.horizon = horizonFor(H, player.pitch, 0);
+
+      const cam = thirdPerson
+        ? thirdPersonCamera(world, player.x, player.y, player.yaw, 4.6, player.feetZ)
+        : { ok: false };
+
+      if (cam.ok) {
+        renderFrame(world, pixels, W, H,
+                    { x: cam.x, y: cam.y, z: cam.z, angle: player.yaw }, opts);
+        drawCharacter(pixels, W, H, cam.z, player.feetZ, cam.dist, opts,
+                      player.walkPhase, player.moving, !!keys["shift"]);
+      } else {
+        // First person, and also the fallback when the third-person camera
+        // has nowhere to stand.
+        renderFrame(world, pixels, W, H,
+                    { x: player.x, y: player.y, z: eyeZ, angle: player.yaw }, opts);
+        drawHand(pixels, W, H, slot, player.bob,
+                 player.moving && player.onGround);
+      }
+      ctx.putImageData(img, 0, 0);
+
+      drawMinimap();
+      compass.textContent = compassText();
+
+      acc += dt; frames++;
+      if (acc > 0.4) { fps = frames / acc; frames = 0; acc = 0; }
+      const gb = BLOCKS[cellBlock(world, player.x|0, player.y|0)].name;
+      statsEl.innerHTML =
+        `XYZ ${player.x.toFixed(1)} ${player.y.toFixed(1)} ${player.feetZ.toFixed(1)}<br>` +
+        `on ${gb}${player.inWater ? " (wading)" : ""}${player.flying ? " · flying" : ""}<br>` +
+        `${W}\u00D7${H} &nbsp; ${fps.toFixed(0)} fps`;
+    }
+    requestAnimationFrame(tick);
+  }
+  requestAnimationFrame(tick);
+}
+
+if (typeof module !== "undefined") {
+  module.exports = { GRID, BLOCKS, renderFrame, defaultSpawn, defaultAngle,
+                     cellHeight, cellBlock, player, updatePlayer, eyeHeight,
+                     drawCharacter, drawHand, thirdPersonCamera, horizonFor };
+}
+</script>
+</body>
+</html>
