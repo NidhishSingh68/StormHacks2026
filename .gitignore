@@ -18,3 +18,10 @@ fpga/hps_sdram_p0_all_pins.txt
 fpga/hps_sdram_p0_summary.csv
 fpga/*.log
 fpga/.qsys_edit/
+
+# Voxel game build outputs and generated terrain (make / make terrain)
+/minecraft/mc
+/minecraft/mc_host
+/minecraft/terrain_gen
+/minecraft/terrain.bin
+/minecraft/terrain_preview.ppm
