@@ -434,7 +434,7 @@ static void *worker_main(void *arg)
  * with the worker's help */
 static void render_frame(int b, uint32_t *zbuf)
 {
-    int n = render_prologue(cmdbuf[b], GPU_REGION_WORDS);
+    int n = render_prologue(&frame, cmdbuf[b], GPU_REGION_WORDS);
 
     if (!use_gpu)
         gpu_sw_region(cmdbuf[b], (uint32_t)n, back[b], zbuf);
@@ -847,9 +847,8 @@ static int screenshot(const struct camera *cam, const char *path, int breaks, in
                 int n = 0;
 
                 while ((c[n] & 15) != GPU_END)
-                    n += (c[n] & 15) == GPU_SPAN ? 5 : (c[n] & 15) == GPU_BLEND ? 6 :
-                         (c[n] & 15) == GPU_FILL || (c[n] & 15) == GPU_SHADE ? 2 :
-                         (c[n] & 15) == GPU_COLORS ? 3 : 1;
+                    n += (c[n] & 15) == GPU_POLY ? 4 + (int)((c[n] >> 5) & 7) :
+                         (c[n] & 15) == GPU_FILL || (c[n] & 15) == GPU_TINT ? 2 : 1;
                 total += n + 1;
                 if (n + 1 > most)
                     most = n + 1;

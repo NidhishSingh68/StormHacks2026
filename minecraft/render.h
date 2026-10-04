@@ -62,8 +62,8 @@ struct camera {
 
 /* A screen-space convex polygon, one per visible block-face rectangle. */
 struct edge {
-    float y0, y1;               /* covers rows whose centre is in [y0, y1) */
-    float x0, dxdy;             /* x at y0, and slope */
+    int16_t r0, r1;             /* covers rows r0 .. r1 - 1 */
+    float x, dx;                /* x at the centre of row r0, step per row */
 };
 
 struct poly {
@@ -107,13 +107,13 @@ void render_setup(struct frame *fr, const struct camera *cam, const struct view 
 
 /*
  * The frame as GPU commands (gpu.h): render_prologue() writes region 0
- * (colour sets, when they changed since the last call), render_band() the
+ * (camera; colours, when they changed since the last call), render_band() the
  * commands drawing rows [band * BAND_H, (band + 1) * BAND_H). Both return
  * the number of 64-bit words written (at most cap, ending with END).
  * Different bands may be built by different threads at the same time; the
  * prologue only by the thread that calls render_set_env().
  */
-int render_prologue(uint64_t *cmd, int cap);
+int render_prologue(const struct frame *fr, uint64_t *cmd, int cap);
 int render_band(const struct frame *fr, int band, uint64_t *cmd, int cap);
 
 /* Put the colour sets into the next prologue again (e.g. after a GPU reset). */

@@ -461,19 +461,33 @@ static void add_quad(struct frame *fr, const struct quad *q, const int *sel)
     p->ybot = (int16_t)ybot;
     p->nedges = 0;
     for (i = 0; i < n; i++) {
-        int j = (i + 1) % n;
+        int j = (i + 1) % n, r0, r1;
+        float ya, yb, xa, dxdy;
         struct edge *e;
 
         if (sy[i] == sy[j])
             continue;
-        e = &p->e[p->nedges++];
         if (sy[i] < sy[j]) {
-            e->y0 = sy[i]; e->y1 = sy[j]; e->x0 = sx[i];
+            ya = sy[i]; yb = sy[j]; xa = sx[i];
         } else {
-            e->y0 = sy[j]; e->y1 = sy[i]; e->x0 = sx[j];
+            ya = sy[j]; yb = sy[i]; xa = sx[j];
         }
-        e->dxdy = (sx[j] - sx[i]) / (sy[j] - sy[i]);
+        /* rows whose centre is in [ya, yb) */
+        r0 = (int)ceilf(ya - 0.5f);
+        r1 = (int)ceilf(yb - 0.5f);
+        if (r0 < ytop) r0 = ytop;
+        if (r1 > ybot) r1 = ybot;
+        if (r0 >= r1)
+            continue;
+        dxdy = (sx[j] - sx[i]) / (sy[j] - sy[i]);
+        e = &p->e[p->nedges++];
+        e->r0 = (int16_t)r0;
+        e->r1 = (int16_t)r1;
+        e->dx = dxdy;
+        e->x = xa + (r0 + 0.5f - ya) * dxdy;
     }
+    if (p->nedges == 0)
+        return;
 
     /* 1/depth on the face plane: d[a] / (plane - eye[a]) along view ray d */
     k = 1.0f / ((float)q->d * HALF - fr->eye[a]);
@@ -717,11 +731,6 @@ static inline int fog_index(float z)
     return (int)f;
 }
 
-static inline int32_t fixed16(float v)
-{
-    return (int32_t)(v * 65536.0f);
-}
-
 static void fill(struct cmds *c, int y, int x0, int x1, uint32_t rgb)
 {
     uint64_t *w;
@@ -747,143 +756,45 @@ static void fill_z(struct cmds *c, int y, int x0, int x1, uint32_t rgb, float iz
     w[1] = gpu_pair(rgb, gpu_iz(iz));
 }
 
-/* see-through overlay of a whole run, no grid lines, no depth test */
+/* see-through overlay of a run of pixels */
 static void tint(struct cmds *c, int y, int x0, int x1, uint32_t rgb, int alpha)
 {
     uint64_t *w;
 
-    if (x0 >= x1 || !(w = put(c, 6)))
+    if (x0 >= x1 || !(w = put(c, 2)))
         return;
-    w[0] = gpu_hdr(GPU_BLEND, x0, x1, y);
-    w[1] = w[2] = w[3] = 0;
-    w[4] = (uint64_t)rgb << 16 | (uint64_t)alpha << 40;
-    w[5] = 0;
+    w[0] = gpu_hdr(GPU_TINT, x0, x1, y);
+    w[1] = rgb | (uint64_t)alpha << 24;
 }
 
-/*
- * A span of a horizontal face: 1/z is constant across it, and the world
- * coordinates step by a constant per pixel.
- */
-static void span_flat(struct cmds *c, const struct frame *fr, const struct poly *p,
-                      int y, int x0, int x1)
+/* The rows of polygon p inside rows [y0, y1) of a band. */
+static void poly_cmd(struct cmds *c, const struct frame *fr, const struct poly *p,
+                     int y0, int y1)
 {
-    float pyc = y + 0.5f, px = x0 + 0.5f;
-    float invz = p->ia + p->ic * pyc;
-    float z, z2, bx, bz, wx, wz, sx, sz, fx, fz;
-    uint64_t *w, hdr, set;
+    int ya = p->ytop > y0 ? p->ytop : y0, yb = p->ybot < y1 ? p->ybot : y1;
+    int kind = !p->trans ? GPU_SOLID : p->block == BLOCK_GLASS ? GPU_GLASS : GPU_WATER;
+    uint64_t *w, edges[GPU_MAX_EDGES];
+    int e, n = 0;
 
-    if (invz <= 1e-6f)
-        return;
-    z = 1.0f / invz;
+    for (e = 0; e < p->nedges; e++) {
+        const struct edge *ed = &p->e[e];
+        int s = ed->r0 > ya ? ed->r0 : ya, t = ed->r1 < yb ? ed->r1 : yb;
 
-    /* world x and z of the first pixel, and their change per pixel */
-    bx = fr->dk0[0] + fr->dky[0] * pyc;
-    bz = fr->dk0[2] + fr->dky[2] * pyc;
-    wx = fr->eye[0] + z * (bx + fr->dkx[0] * px);
-    wz = fr->eye[2] + z * (bz + fr->dkx[2] * px);
-    sx = z * fr->dkx[0];
-    sz = z * fr->dkx[2];
-
-    /* pixel footprint along x and z, including towards the next row */
-    z2 = (invz + p->ic > 1e-6f) ? 1.0f / (invz + p->ic) : z * 4.0f;
-    fx = fabsf(fr->eye[0] + z2 * (bx + fr->dky[0] + fr->dkx[0] * px) - wx);
-    fz = fabsf(fr->eye[2] + z2 * (bz + fr->dky[2] + fr->dkx[2] * px) - wz);
-    if (fabsf(sx) > fx) fx = fabsf(sx);
-    if (fabsf(sz) > fz) fz = fabsf(sz);
-
-    set = (uint64_t)SET_INDEX(p->block, p->face, fog_index(z)) << 35;
-    if (block_plain[p->block] || fx > 0.3f || fz > 0.3f) {
-        /* water, or blocks only a few pixels wide: plain colour */
-        if ((w = put(c, 2))) {
-            w[0] = gpu_hdr(GPU_SHADE, x0, x1, y) | set;
-            w[1] = gpu_pair(gpu_iz(invz), 0);
-        }
-        return;
+        if (s < t)
+            edges[n++] = gpu_edge(ed->x + (double)(s - ed->r0) * ed->dx, ed->dx,
+                                  s - ya, t - ya);
     }
-    if (!(w = put(c, 5)))
+    if (n == 0 || !(w = put(c, 4 + n)))
         return;
-    hdr = gpu_hdr(GPU_SPAN, x0, x1, y) | set;
-    w[1] = gpu_pair(gpu_iz(invz), 0);
-    /* a = world x, b = world z */
-    w[0] = hdr | (p->sel ? GPU_FLAG : 0) | (uint64_t)(uint16_t)fixed16(fx) << 48;
-    w[2] = gpu_pair((uint32_t)fixed16(wx), (uint32_t)fixed16(sx));
-    w[3] = gpu_pair((uint32_t)fixed16(wz), (uint32_t)fixed16(sz));
-    w[4] = (uint64_t)(uint16_t)fixed16(fz) | (uint64_t)(uint16_t)fr->sel[0] << 16 |
-           (uint64_t)(uint16_t)fr->sel[2] << 32;
-}
-
-/*
- * A span of a vertical or see-through face, cut into pieces of SUBSPAN
- * pixels: exact 1/z, world coordinates perspective-correct at the ends of
- * each piece and linear in between.
- */
-#define SUBSPAN         16
-
-static void span_wall(struct cmds *c, const struct frame *fr, const struct poly *p,
-                      int y, int sx0, int sx1)
-{
-    int ka = (p->axis + 1) % 3, kb = (p->axis + 2) % 3;
-    int trans = p->trans, mat = (p->block == BLOCK_GLASS) ? MAT_GLASS : MAT_WATER;
-    float pyc = y + 0.5f;
-    float iz_row = p->ia + p->ic * pyc;
-    float ba = fr->dk0[ka] + fr->dky[ka] * pyc;
-    float bb = fr->dk0[kb] + fr->dky[kb] * pyc;
-    uint32_t diz = gpu_iz(p->ib);
-    int xs;
-
-    for (xs = sx0; xs < sx1; xs += SUBSPAN) {
-        int xe = (xs + SUBSPAN < sx1) ? xs + SUBSPAN : sx1, n = xe - xs, set;
-        float pa = xs + 0.5f, pb = xe + 0.5f;
-        float izs = iz_row + p->ib * pa, ize = iz_row + p->ib * pb;
-        float zs, ze, was, wbs, sa, sb, fa, fb;
-        uint64_t *w, hdr;
-
-        if (izs < 1e-6f) izs = 1e-6f;
-        if (ize < 1e-6f) ize = 1e-6f;
-        zs = 1.0f / izs;
-        ze = 1.0f / ize;
-        was = fr->eye[ka] + zs * (ba + fr->dkx[ka] * pa);
-        wbs = fr->eye[kb] + zs * (bb + fr->dkx[kb] * pa);
-        sa = (fr->eye[ka] + ze * (ba + fr->dkx[ka] * pb) - was) / n;
-        sb = (fr->eye[kb] + ze * (bb + fr->dkx[kb] * pb) - wbs) / n;
-
-        /* footprint: along the span, or one pixel's worth at this depth */
-        fa = fabsf(sa); if (zs / focal > fa) fa = zs / focal;
-        fb = fabsf(sb); if (zs / focal > fb) fb = zs / focal;
-        set = SET_INDEX(p->block, p->face, fog_index(zs));
-
-        if (trans) {
-            int fog = fog_index(zs);
-
-            if (!(w = put(c, 6)))
-                return;
-            w[0] = gpu_hdr(GPU_BLEND, xs, xe, y) | GPU_FLAG;
-            w[4] = (uint64_t)mat_fog_rgb[mat][fog] << 16 | (uint64_t)mat_alpha8[mat] << 40;
-            w[5] = set_rgb[set][TONE_LINE];
-            /* glass frame lines, while blocks are big enough to show them */
-            if (mat == MAT_GLASS && fa < 0.3f && fb < 0.3f) {
-                w[0] |= (uint64_t)(uint16_t)fixed16(fa) << 48;
-                w[4] |= (uint16_t)fixed16(fb);
-            }
-        } else {
-            if (block_plain[p->block] || fa > 0.3f || fb > 0.3f) {
-                if (!(w = put(c, 2)))
-                    return;
-                w[0] = gpu_hdr(GPU_SHADE, xs, xe, y) | (uint64_t)set << 35;
-                w[1] = gpu_pair(gpu_iz(izs), diz);
-                continue;
-            }
-            if (!(w = put(c, 5)))
-                return;
-            hdr = gpu_hdr(GPU_SPAN, xs, xe, y) | (uint64_t)set << 35;
-            w[0] = hdr | (p->sel ? GPU_FLAG : 0) | (uint64_t)(uint16_t)fixed16(fa) << 48;
-            w[4] = (uint64_t)(uint16_t)fixed16(fb) | (uint64_t)(uint16_t)fr->sel[ka] << 16 |
-                   (uint64_t)(uint16_t)fr->sel[kb] << 32;
-        }
-        w[1] = gpu_pair(gpu_iz(izs), diz);
-        w[2] = gpu_pair((uint32_t)fixed16(was), (uint32_t)fixed16(sa));
-        w[3] = gpu_pair((uint32_t)fixed16(wbs), (uint32_t)fixed16(sb));
-    }
+    w[0] = gpu_hdr(GPU_POLY, 0, 0, ya) | (p->sel ? GPU_FLAG : 0) |
+           (uint64_t)n << 5 | (uint64_t)p->axis << 8 | (uint64_t)kind << 10 |
+           (uint64_t)(yb - ya) << 16 | (uint64_t)SET_INDEX(p->block, p->face, 0) << 35;
+    w[1] = (uint64_t)gpu_fix64((double)p->ia + (double)p->ib * 0.5 +
+                               (double)p->ic * (ya + 0.5), GPU_IZ_SCALE);
+    w[2] = (uint64_t)gpu_fix64(p->ib, GPU_IZ_SCALE);
+    w[3] = (uint64_t)gpu_fix64(p->ic, GPU_IZ_SCALE);
+    memcpy(w + 4, edges, n * sizeof(*w));
+    (void)fr;
 }
 
 /* ---- HUD ------------------------------------------------------------------ */
@@ -1044,22 +955,50 @@ void render_resend_colors(void)
     sets_dirty = 1;
 }
 
-int render_prologue(uint64_t *cmd, int cap)
+int render_prologue(const struct frame *fr, uint64_t *cmd, int cap)
 {
-    int n = 0, s;
+    uint64_t sel = 0;
+    int32_t n0[3], nx[3], ny[3], eye[3];
+    int n = 0, s, k;
 
-    if (sets_dirty && cap > GPU_COLOR_SETS * 3) {
+    if (sets_dirty && cap > GPU_COLOR_SETS * 3 + 64) {
         for (s = 0; s < GPU_COLOR_SETS; s++) {
-            const uint32_t *k = set_rgb[s];
-            uint64_t lo = (uint64_t)k[0] | (uint64_t)k[1] << 24 | (uint64_t)k[2] << 48;
-            uint64_t hi = (uint64_t)(k[2] >> 16) | (uint64_t)k[3] << 8 | (uint64_t)k[4] << 32;
+            const uint32_t *t = set_rgb[s];
+            uint64_t lo = (uint64_t)t[0] | (uint64_t)t[1] << 24 | (uint64_t)t[2] << 48;
+            uint64_t hi = (uint64_t)(t[2] >> 16) | (uint64_t)t[3] << 8 | (uint64_t)t[4] << 32;
 
             cmd[n++] = (uint64_t)GPU_COLORS | (uint64_t)s << 35;
             cmd[n++] = lo;
             cmd[n++] = hi;
         }
+        cmd[n++] = GPU_MATS;
+        for (k = 0; k < GPU_FOG_LEVELS; k++)
+            cmd[n++] = mat_fog_rgb[MAT_WATER][k] | (uint64_t)mat_fog_rgb[MAT_GLASS][k] << 24;
         sets_dirty = 0;
     }
+
+    /* camera: the view ray through the centre of pixel (x, y) */
+    for (k = 0; k < 3; k++) {
+        n0[k] = gpu_fix32((double)fr->dk0[k] + 0.5 * fr->dkx[k] + 0.5 * fr->dky[k],
+                          GPU_N_SCALE);
+        nx[k] = gpu_fix32(fr->dkx[k], GPU_N_SCALE);
+        ny[k] = gpu_fix32(fr->dky[k], GPU_N_SCALE);
+        eye[k] = gpu_fix32(fr->eye[k], 65536.0);
+    }
+    if (fr->sel_valid)
+        sel = (uint64_t)(uint16_t)fr->sel[0] | (uint64_t)(uint16_t)fr->sel[1] << 16 |
+              (uint64_t)(uint16_t)fr->sel[2] << 32;
+    cmd[n++] = GPU_FRAME;
+    cmd[n++] = gpu_pair((uint32_t)n0[0], (uint32_t)nx[0]);
+    cmd[n++] = gpu_pair((uint32_t)ny[0], (uint32_t)n0[1]);
+    cmd[n++] = gpu_pair((uint32_t)nx[1], (uint32_t)ny[1]);
+    cmd[n++] = gpu_pair((uint32_t)n0[2], (uint32_t)nx[2]);
+    cmd[n++] = gpu_pair((uint32_t)ny[2], (uint32_t)eye[0]);
+    cmd[n++] = gpu_pair((uint32_t)eye[1], (uint32_t)eye[2]);
+    cmd[n++] = gpu_pair((uint32_t)gpu_fix32(fog_start, 65536.0),
+                        (uint32_t)gpu_fix32(fog_scale, 16777216.0));
+    cmd[n++] = sel | (uint64_t)mat_alpha8[MAT_WATER] << 48 |
+               (uint64_t)mat_alpha8[MAT_GLASS] << 56;
     cmd[n++] = GPU_END;
     return n;
 }
@@ -1089,41 +1028,12 @@ int render_band(const struct frame *fr, int band, uint64_t *cmd, int cap)
 
     /* pass 0: solid faces (writing depth), pass 1: see-through faces */
     for (pass = 0; pass < 2; pass++)
-    for (i = 0; i < fr->band_count[band]; i++) {
-        const struct poly *p = &fr->polys[fr->band_polys[band][i]];
-        int ya = p->ytop > y0 ? p->ytop : y0;
-        int yb = p->ybot < y1 ? p->ybot : y1;
+        for (i = 0; i < fr->band_count[band]; i++) {
+            const struct poly *p = &fr->polys[fr->band_polys[band][i]];
 
-        if (p->trans != pass)
-            continue;
-
-        for (y = ya; y < yb; y++) {
-            float yc = y + 0.5f, xl = 1e30f, xr = -1e30f;
-            int e, x0, x1;
-
-            for (e = 0; e < p->nedges; e++) {
-                const struct edge *ed = &p->e[e];
-
-                if (yc >= ed->y0 && yc < ed->y1) {
-                    float x = ed->x0 + (yc - ed->y0) * ed->dxdy;
-
-                    if (x < xl) xl = x;
-                    if (x > xr) xr = x;
-                }
-            }
-            if (xl > xr)
-                continue;
-            x0 = (xl < 0.0f) ? 0 : (int)ceilf(xl - 0.5f);
-            x1 = (xr > SCREEN_W) ? SCREEN_W : (int)ceilf(xr - 0.5f);
-            if (x0 >= x1)
-                continue;
-
-            if (p->axis == 1 && !p->trans)
-                span_flat(&c, fr, p, y, x0, x1);
-            else
-                span_wall(&c, fr, p, y, x0, x1);
+            if (p->trans == pass)
+                poly_cmd(&c, fr, p, y0, y1);
         }
-    }
 
     for (y = y0; y < y1; y++) {
         if (fr->nparticles && !fr->underwater)

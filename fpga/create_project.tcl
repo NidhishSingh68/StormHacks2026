@@ -21,6 +21,10 @@ source pin_assignment_DE1_SoC.tcl
 # buffers need.
 set_parameter -name maximum_depth 2048 -to "soc_system:u0|soc_system_fb_ram:fb_ram|altsyncram:the_altsyncram"
 
+# The GPU's long pipelines as plain registers: shift registers packed into
+# MLAB memory miss hold timing on this design
+set_instance_assignment -name AUTO_SHIFT_REGISTER_RECOGNITION OFF -to "span_gpu:u_gpu"
+
 # Leave unused board pins (audio, SDRAM, GPIO headers, ...) tri-stated
 set_global_assignment -name RESERVE_ALL_UNUSED_PINS_WEAK_PULLUP "AS INPUT TRI-STATED"
 
