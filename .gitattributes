@@ -1,0 +1,12 @@
+# Keep Unix line endings even in a Windows-side clone: scripts run in WSL
+# or on the board break with CRLF.
+*.sh        text eol=lf
+*.py        text eol=lf
+*.c         text eol=lf
+*.h         text eol=lf
+*.v         text eol=lf
+*.tcl       text eol=lf
+*.sdc       text eol=lf
+*.service   text eol=lf
+Makefile    text eol=lf
+*.png       binary
