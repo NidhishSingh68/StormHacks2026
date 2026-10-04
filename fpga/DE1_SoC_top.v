@@ -4,8 +4,8 @@
 // Altera-FPGA-top-level-files), so that script assigns every pin used here.
 //
 //   HPS writes pixels  -> 0xC0000000 .. 0xC004AFFF  (fb_ram, 640x480 RGB332)
-//   or the frame DMA copies them from DDR (registers at 0xFF200100 / 0x200;
-//   its reads go through acp_read_adapter, see there)
+//   or the span GPU draws them from command lists in DDR (registers at
+//   0xFF200100; its reads go through acp_read_adapter, see there)
 //   HPS reads status   <- 0xFF200000                (vga_frame PIO)
 //                           [31]   1 while in vertical blanking
 //                           [30:0] frames completed (increments on vblank)
@@ -105,13 +105,23 @@ module DE1_SoC_top (
     wire        vblank;
     reg  [31:0] frame_status;
 
-    // frame DMA read path: Avalon from the DMA, coherent AXI to the HPS
+    // span GPU command reads: Avalon from the GPU, coherent AXI to the HPS
     wire        sys_clk;
-    wire [31:0] dma_address;
-    wire        dma_read, dma_waitrequest, dma_readdatavalid;
-    wire [2:0]  dma_burstcount;
-    wire [7:0]  dma_byteenable;
-    wire [63:0] dma_readdata;
+    wire [31:0] cmd_address;
+    wire        cmd_read, cmd_waitrequest, cmd_readdatavalid;
+    wire [2:0]  cmd_burstcount;
+    wire [63:0] cmd_readdata;
+
+    wire [7:0]  csr_address;
+    wire        csr_read, csr_write, csr_readdatavalid;
+    wire [31:0] csr_writedata, csr_readdata;
+
+    wire [18:0] gfb_address;
+    wire        gfb_write, gfb_waitrequest;
+    wire [63:0] gfb_writedata;
+    wire [7:0]  gfb_byteenable;
+
+    wire [15:0] beam;
 
     wire [7:0]  ax_arid, ax_awid, ax_wid, ax_wstrb;
     wire [31:0] ax_araddr, ax_awaddr;
@@ -141,13 +151,28 @@ module DE1_SoC_top (
         .vga_frame_export                 (frame_status),
 
         .sys_clk_clk                      (sys_clk),
-        .dma_rd_address                   (dma_address),
-        .dma_rd_read                      (dma_read),
-        .dma_rd_byteenable                (dma_byteenable),
-        .dma_rd_readdata                  (dma_readdata),
-        .dma_rd_waitrequest               (dma_waitrequest),
-        .dma_rd_readdatavalid             (dma_readdatavalid),
-        .dma_rd_burstcount                (dma_burstcount),
+
+        .gpu_csr_waitrequest              (1'b0),
+        .gpu_csr_readdata                 (csr_readdata),
+        .gpu_csr_readdatavalid            (csr_readdatavalid),
+        .gpu_csr_burstcount               (),
+        .gpu_csr_writedata                (csr_writedata),
+        .gpu_csr_address                  (csr_address),
+        .gpu_csr_write                    (csr_write),
+        .gpu_csr_read                     (csr_read),
+        .gpu_csr_byteenable               (),
+        .gpu_csr_debugaccess              (),
+
+        .gpu_fb_waitrequest               (gfb_waitrequest),
+        .gpu_fb_readdata                  (),
+        .gpu_fb_readdatavalid             (),
+        .gpu_fb_burstcount                (1'b1),
+        .gpu_fb_writedata                 (gfb_writedata),
+        .gpu_fb_address                   (gfb_address),
+        .gpu_fb_write                     (gfb_write),
+        .gpu_fb_read                      (1'b0),
+        .gpu_fb_byteenable                (gfb_byteenable),
+        .gpu_fb_debugaccess               (1'b0),
 
         .f2h_axi_awid    (ax_awid),    .f2h_axi_awaddr  (ax_awaddr),  .f2h_axi_awlen   (ax_awlen),
         .f2h_axi_awsize  (ax_awsize),  .f2h_axi_awburst (ax_awburst), .f2h_axi_awlock  (ax_awlock),
@@ -237,14 +262,56 @@ module DE1_SoC_top (
         .hps_io_hps_io_i2c1_inst_SCL      (HPS_I2C2_SCLK)
     );
 
+    // ---- span GPU ------------------------------------------------------------
+
+    reg [1:0] sys_rst_sync;
+    always @(posedge sys_clk or negedge hps_reset_n)
+        if (!hps_reset_n) sys_rst_sync <= 2'b00;
+        else              sys_rst_sync <= {sys_rst_sync[0], 1'b1};
+
+    // the beam position crosses from the pixel clock; it changes only every
+    // 16 lines, so a value seen twice in a row is a whole one
+    reg [15:0] beam_s1, beam_s2, beam_s3, beam_sys;
+    always @(posedge sys_clk) begin
+        beam_s1 <= beam;
+        beam_s2 <= beam_s1;
+        beam_s3 <= beam_s2;
+        if (beam_s2 == beam_s3)
+            beam_sys <= beam_s3;
+    end
+
+    span_gpu u_gpu (
+        .clk               (sys_clk),
+        .reset             (!sys_rst_sync[1]),
+        .csr_address       (csr_address[7:2]),
+        .csr_read          (csr_read),
+        .csr_write         (csr_write),
+        .csr_writedata     (csr_writedata),
+        .csr_readdata      (csr_readdata),
+        .csr_readdatavalid (csr_readdatavalid),
+        .cmd_address       (cmd_address),
+        .cmd_read          (cmd_read),
+        .cmd_burstcount    (cmd_burstcount),
+        .cmd_readdata      (cmd_readdata),
+        .cmd_waitrequest   (cmd_waitrequest),
+        .cmd_readdatavalid (cmd_readdatavalid),
+        .fb_address        (gfb_address),
+        .fb_write          (gfb_write),
+        .fb_writedata      (gfb_writedata),
+        .fb_byteenable     (gfb_byteenable),
+        .fb_waitrequest    (gfb_waitrequest),
+        .beam_scan         (beam_sys[15:5]),
+        .beam_band         (beam_sys[4:0])
+    );
+
     acp_read_adapter u_acp (
         .clk               (sys_clk),
-        .avm_address       (dma_address),
-        .avm_read          (dma_read),
-        .avm_burstcount    (dma_burstcount),
-        .avm_readdata      (dma_readdata),
-        .avm_waitrequest   (dma_waitrequest),
-        .avm_readdatavalid (dma_readdatavalid),
+        .avm_address       (cmd_address),
+        .avm_read          (cmd_read),
+        .avm_burstcount    (cmd_burstcount),
+        .avm_readdata      (cmd_readdata),
+        .avm_waitrequest   (cmd_waitrequest),
+        .avm_readdatavalid (cmd_readdatavalid),
         .arid (ax_arid), .araddr (ax_araddr), .arlen (ax_arlen), .arsize (ax_arsize),
         .arburst (ax_arburst), .arlock (ax_arlock), .arcache (ax_arcache), .arprot (ax_arprot),
         .aruser (ax_aruser), .arvalid (ax_arvalid), .arready (ax_arready),
@@ -276,7 +343,8 @@ module DE1_SoC_top (
         .vga_blank_n  (VGA_BLANK_N),
         .vga_sync_n   (VGA_SYNC_N),
         .vga_clk      (VGA_CLK),
-        .vblank       (vblank)
+        .vblank       (vblank),
+        .beam         (beam)
     );
 
     // ---- frame counter (50 MHz domain, read by the HPS) ----------------------

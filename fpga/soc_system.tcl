@@ -2,19 +2,20 @@
 #
 #   HPS --h2f_axi_master (64-bit)----> fb_ram.s1        @ 0xC0000000 (300 KB)
 #       --h2f_lw_axi_master (32-bit)-> vga_frame.s1     @ 0xFF200000 (frame ctr)
-#                                   -> fb_dma.csr       @ 0xFF200100
-#                                   -> fb_dma.descriptor_slave @ 0xFF200200
+#                                   -> gpu_csr (bridge) @ 0xFF200100, exported
 #
-#   fb_dma (mSGDMA, memory to memory) copies frames from DDR into fb_ram:
-#     mm_read  -> exported as dma_rd; the top level turns it into cache-
-#                 coherent AXI reads on the FPGA-to-HPS bridge (f2h_axi), via
-#                 the ARM's ACP window at 0x80000000 = DDR address 0
-#     mm_write -> fb_ram.s1
-#   (Platform Designer cannot mark an Avalon master's reads as cacheable, and
-#   the CPU's newest pixels may still be in its caches, hence the top level.)
+#   The span GPU (span_gpu.v) lives in the top level:
+#     its registers   <- gpu_csr: a bridge whose master side is exported
+#     its framebuffer -> gpu_fb: a bridge whose slave side is exported,
+#                        writing fb_ram.s1
+#     its command reads go straight to the FPGA-to-HPS bridge (f2h_axi) as
+#     cache-coherent AXI reads through the ARM's ACP window (0x80000000 =
+#     DDR address 0); Platform Designer cannot mark an Avalon master's
+#     reads as cacheable, and the CPU's newest commands may still be in its
+#     caches, hence the top level.
 #
 #   fb_ram.s2 (read port) is exported to the VGA scanout logic, which runs
-#   from pll_0's 25.175 MHz pixel clock. Bridges, DMA and fb_ram's write
+#   from pll_0's 25.175 MHz pixel clock. Bridges, GPU and fb_ram's write
 #   port run at 100 MHz (pll_0 outclk1, exported as sys_clk).
 #
 # Framebuffer: 640 x 480, 8 bpp RGB332, one byte per pixel, row-major,
@@ -52,7 +53,7 @@ set_instance_parameter_value pll_0 gui_use_locked false
 add_instance vga_clk_bridge altera_clock_bridge
 set_instance_parameter_value vga_clk_bridge EXPLICIT_CLOCK_RATE 25175000.0
 
-# 100 MHz system clock, also needed by the DMA read adapter in the top level
+# 100 MHz system clock, also needed by the span GPU in the top level
 add_instance sys_clk_bridge altera_clock_bridge
 set_instance_parameter_value sys_clk_bridge EXPLICIT_CLOCK_RATE 100000000.0
 
@@ -162,21 +163,29 @@ set_instance_parameter_value fb_ram writable true
 set_instance_parameter_value fb_ram initMemContent false
 set_instance_parameter_value fb_ram blockType AUTO
 
-# ---- frame DMA: DDR -> fb_ram, in bursts --------------------------------------
+# ---- span GPU attachments -----------------------------------------------------
 
-add_instance fb_dma altera_msgdma
-set_instance_parameter_value fb_dma MODE 0
-set_instance_parameter_value fb_dma DATA_WIDTH 64
-set_instance_parameter_value fb_dma DATA_FIFO_DEPTH 256
-set_instance_parameter_value fb_dma DESCRIPTOR_FIFO_DEPTH 128
-set_instance_parameter_value fb_dma RESPONSE_PORT 2
-set_instance_parameter_value fb_dma MAX_BYTE 65536
-set_instance_parameter_value fb_dma TRANSFER_TYPE {Full Word Accesses Only}
-set_instance_parameter_value fb_dma BURST_ENABLE 1
-set_instance_parameter_value fb_dma MAX_BURST_COUNT 4
-set_instance_parameter_value fb_dma BURST_WRAPPING_SUPPORT 1
-set_instance_parameter_value fb_dma USE_FIX_ADDRESS_WIDTH 1
-set_instance_parameter_value fb_dma FIX_ADDRESS_WIDTH 32
+# registers: LW bridge -> this bridge -> exported master -> span_gpu
+add_instance gpu_csr altera_avalon_mm_bridge
+set_instance_parameter_value gpu_csr DATA_WIDTH 32
+set_instance_parameter_value gpu_csr SYMBOL_WIDTH 8
+set_instance_parameter_value gpu_csr ADDRESS_WIDTH 8
+set_instance_parameter_value gpu_csr ADDRESS_UNITS SYMBOLS
+set_instance_parameter_value gpu_csr MAX_BURST_SIZE 1
+set_instance_parameter_value gpu_csr MAX_PENDING_RESPONSES 4
+set_instance_parameter_value gpu_csr PIPELINE_COMMAND 1
+set_instance_parameter_value gpu_csr PIPELINE_RESPONSE 1
+
+# framebuffer writes: span_gpu -> exported slave -> this bridge -> fb_ram.s1
+add_instance gpu_fb altera_avalon_mm_bridge
+set_instance_parameter_value gpu_fb DATA_WIDTH 64
+set_instance_parameter_value gpu_fb SYMBOL_WIDTH 8
+set_instance_parameter_value gpu_fb ADDRESS_WIDTH 19
+set_instance_parameter_value gpu_fb ADDRESS_UNITS SYMBOLS
+set_instance_parameter_value gpu_fb MAX_BURST_SIZE 1
+set_instance_parameter_value gpu_fb MAX_PENDING_RESPONSES 4
+set_instance_parameter_value gpu_fb PIPELINE_COMMAND 1
+set_instance_parameter_value gpu_fb PIPELINE_RESPONSE 1
 
 # ---- frame counter (input PIO, read by the CPU for vblank sync) -------------
 
@@ -197,14 +206,16 @@ add_connection pll_0.outclk1   sys_clk_bridge.in_clk
 add_connection pll_0.outclk1 hps_0.h2f_axi_clock
 add_connection pll_0.outclk1 hps_0.f2h_axi_clock
 add_connection pll_0.outclk1 fb_ram.clk1
-add_connection pll_0.outclk1 fb_dma.clock
+add_connection pll_0.outclk1 gpu_csr.clk
+add_connection pll_0.outclk1 gpu_fb.clk
 add_connection clk_0.clk hps_0.h2f_lw_axi_clock
 add_connection clk_0.clk vga_frame.clk
 
 add_connection clk_0.clk_reset fb_ram.reset1
 add_connection clk_0.clk_reset fb_ram.reset2
 add_connection clk_0.clk_reset vga_frame.reset
-add_connection clk_0.clk_reset fb_dma.reset_n
+add_connection clk_0.clk_reset gpu_csr.reset
+add_connection clk_0.clk_reset gpu_fb.reset
 
 # ---- address map -------------------------------------------------------------
 
@@ -214,13 +225,11 @@ set_connection_parameter_value hps_0.h2f_axi_master/fb_ram.s1 baseAddress 0x0000
 add_connection hps_0.h2f_lw_axi_master vga_frame.s1
 set_connection_parameter_value hps_0.h2f_lw_axi_master/vga_frame.s1 baseAddress 0x00000000
 
-add_connection hps_0.h2f_lw_axi_master fb_dma.csr
-set_connection_parameter_value hps_0.h2f_lw_axi_master/fb_dma.csr baseAddress 0x00000100
-add_connection hps_0.h2f_lw_axi_master fb_dma.descriptor_slave
-set_connection_parameter_value hps_0.h2f_lw_axi_master/fb_dma.descriptor_slave baseAddress 0x00000200
+add_connection hps_0.h2f_lw_axi_master gpu_csr.s0
+set_connection_parameter_value hps_0.h2f_lw_axi_master/gpu_csr.s0 baseAddress 0x00000100
 
-add_connection fb_dma.mm_write fb_ram.s1
-set_connection_parameter_value fb_dma.mm_write/fb_ram.s1 baseAddress 0x00000000
+add_connection gpu_fb.m0 fb_ram.s1
+set_connection_parameter_value gpu_fb.m0/fb_ram.s1 baseAddress 0x00000000
 
 # ---- exports -----------------------------------------------------------------
 
@@ -233,7 +242,8 @@ set_interface_property vga_clk    EXPORT_OF vga_clk_bridge.out_clk
 set_interface_property fb_s2      EXPORT_OF fb_ram.s2
 set_interface_property vga_frame  EXPORT_OF vga_frame.external_connection
 set_interface_property sys_clk    EXPORT_OF sys_clk_bridge.out_clk
-set_interface_property dma_rd     EXPORT_OF fb_dma.mm_read
+set_interface_property gpu_csr    EXPORT_OF gpu_csr.m0
+set_interface_property gpu_fb     EXPORT_OF gpu_fb.s0
 set_interface_property f2h_axi    EXPORT_OF hps_0.f2h_axi_slave
 
 save_system soc_system.qsys

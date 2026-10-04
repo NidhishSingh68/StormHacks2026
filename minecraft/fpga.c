@@ -11,6 +11,7 @@
 #include <sys/mman.h>
 #include "mc.h"
 #include "fpga.h"
+#include "gpu.h"
 
 #define FB_BASE         0xC0000000u
 #define STATUS_BASE     0xFF200000u
@@ -64,6 +65,33 @@ int fpga_setup_dma(uint8_t *const bufs[], int n)
     return -1;
 }
 
+int fpga_gpu_open(uint64_t *const bufs[], int n)
+{
+    (void)bufs;
+    (void)n;
+    return -1;
+}
+
+void fpga_gpu_kick(int b)
+{
+    (void)b;
+}
+
+uint32_t fpga_gpu_done(void)
+{
+    return 0;
+}
+
+void fpga_gpu_close(void)
+{
+}
+
+void fpga_gpu_stats(double *frame_ms, double *draw_ms, unsigned *late)
+{
+    *frame_ms = *draw_ms = 0;
+    *late = 0;
+}
+
 #else
 
 #include "fbdma.h"
@@ -75,6 +103,33 @@ static int mem_fd = -1;
 static void *fb_map, *status_map;
 static volatile uint32_t *status_reg;
 static long page_size;
+
+/* ---- span GPU ------------------------------------------------------------- */
+
+#define GPU_CSR         (0x100 / 4)     /* in the lightweight bridge page */
+#define GPU_ID          0
+#define GPU_CTRL        1
+#define GPU_STATUS      2
+#define GPU_PT_INDEX    3
+#define GPU_PT_DATA     4
+#define GPU_BEAM        5
+#define GPU_FRAME_CYC   6
+#define GPU_DRAW_CYC    7
+#define GPU_LATE        8
+#define GPU_ID_VALUE    0x47505531u     /* "GPU1" */
+#define GPU_CTRL_KICK   (1u << 0)
+#define GPU_CTRL_RESET  (1u << 31)
+#define GPU_ST_BUSY     (1u << 16)
+#define GPU_ST_PENDING  (1u << 17)
+#define GPU_CLOCK_MHZ   102.38          /* pll_0 outclk1 */
+
+static volatile uint32_t *gpu;          /* its registers, if it is there */
+static int has_gpu;                     /* this process draws with it */
+
+static int gpu_present(void)
+{
+    return status_map && ((volatile uint32_t *)status_map)[GPU_CSR + GPU_ID] == GPU_ID_VALUE;
+}
 
 /* 0: 64-bit stores, 1: NEON 4 x 64-bit stores */
 static int copy_method;
@@ -103,6 +158,8 @@ int fpga_open(void)
         return -1;
     }
     status_reg = status_map;
+    if (gpu_present())
+        gpu = (volatile uint32_t *)status_map + GPU_CSR;
     return 0;
 }
 
@@ -160,10 +217,95 @@ static void copy_neon(const uint8_t *frame)
 #endif
 }
 
+int fpga_gpu_open(uint64_t *const bufs[], int n)
+{
+    long page = sysconf(_SC_PAGESIZE);
+    int fd, b;
+    size_t off;
+
+    if (!gpu) {
+        printf("span GPU: not in this FPGA bitstream, the CPU draws\n");
+        return -1;
+    }
+    gpu[GPU_CTRL] = GPU_CTRL_RESET;
+
+    fd = open("/proc/self/pagemap", O_RDONLY);
+    if (fd < 0) {
+        perror("span GPU: pagemap");
+        return -1;
+    }
+    for (b = 0; b < n; b++) {
+        if (mlock(bufs[b], GPU_BUF_SIZE) < 0) {
+            perror("span GPU: mlock");
+            close(fd);
+            return -1;
+        }
+        gpu[GPU_PT_INDEX] = (uint32_t)(b * GPU_BUF_STRIDE / page);
+        for (off = 0; off < GPU_BUF_SIZE; off += page) {
+            uintptr_t va = (uintptr_t)bufs[b] + off;
+            uint64_t e;
+            uint64_t pfn;
+
+            if (pread(fd, &e, 8, (off_t)(va / page) * 8) != 8 || !(e >> 63) ||
+                !(pfn = e & ((1ull << 55) - 1)) || pfn * page >= 0x40000000u) {
+                fprintf(stderr, "span GPU: no usable physical address for the commands\n");
+                close(fd);
+                return -1;
+            }
+            gpu[GPU_PT_DATA] = (uint32_t)pfn;
+        }
+    }
+    close(fd);
+    has_gpu = 1;
+    printf("span GPU: drawing frames (%d command buffers, %u KiB each)\n",
+           n, GPU_BUF_SIZE / 1024);
+    return 0;
+}
+
+void fpga_gpu_kick(int b)
+{
+    /* the commands must be in the caches / DDR before the GPU looks */
+    __asm__ volatile("dsb" ::: "memory");
+    while (gpu[GPU_STATUS] & GPU_ST_PENDING)
+        ;
+    gpu[GPU_CTRL] = GPU_CTRL_KICK | (uint32_t)b << 1;
+}
+
+uint32_t fpga_gpu_done(void)
+{
+    return gpu[GPU_STATUS] & 0xFFFF;
+}
+
+void fpga_gpu_close(void)
+{
+    double t0 = now_ms();
+
+    if (!has_gpu)
+        return;
+    /* let it finish what it was given, then make sure it is idle */
+    while ((gpu[GPU_STATUS] & (GPU_ST_BUSY | GPU_ST_PENDING)) && now_ms() - t0 < 100)
+        ;
+    gpu[GPU_CTRL] = GPU_CTRL_RESET;
+    has_gpu = 0;
+}
+
+void fpga_gpu_stats(double *frame_ms, double *draw_ms, unsigned *late)
+{
+    static uint32_t last_late;
+    uint32_t l = gpu[GPU_LATE];
+
+    *frame_ms = gpu[GPU_FRAME_CYC] / (GPU_CLOCK_MHZ * 1000.0);
+    *draw_ms = gpu[GPU_DRAW_CYC] / (GPU_CLOCK_MHZ * 1000.0);
+    *late = l - last_late;
+    last_late = l;
+}
+
 int fpga_setup_dma(uint8_t *const bufs[], int n)
 {
     int i;
 
+    if (gpu_present())                  /* the GPU replaced the frame DMA */
+        return -1;
     if (fbdma_probe(&dma, (volatile uint32_t *)status_map) < 0) {
         printf("frame DMA: not in this FPGA bitstream, the CPU copies frames\n");
         return -1;
@@ -180,6 +322,9 @@ int fpga_setup_dma(uint8_t *const bufs[], int n)
 
 void fpga_present(const uint8_t *frame)
 {
+    /* a GPU still drawing for a game that was killed would draw over this */
+    if (gpu && !has_gpu && (gpu[GPU_STATUS] & (GPU_ST_BUSY | GPU_ST_PENDING)))
+        gpu[GPU_CTRL] = GPU_CTRL_RESET;
     if (use_dma) {
         int i = fbdma_index(&dma, frame);
 

@@ -8,6 +8,10 @@ derive_clock_uncertainty
 # vblank crosses from the pixel clock to CLOCK_50 through a 2-FF synchronizer
 set_false_path -to [get_registers {vblank_sync[0]}]
 
+# the beam position crosses to sys_clk through a synchronizer that only
+# accepts a value seen on two clocks in a row
+set_false_path -to [get_registers {beam_s1[*]}]
+
 # Board-level I/O with no timing relationship we care about
 set_false_path -from [get_ports {KEY_N[*]}]
 set_false_path -to   [get_ports {LEDR[*] HEX*}]

@@ -1,5 +1,5 @@
 /*
- * render.h - software rasterizer for the voxel world
+ * render.h - polygon setup and GPU command lists for the voxel world
  */
 #ifndef RENDER_H
 #define RENDER_H
@@ -106,10 +106,19 @@ void render_init(int render_dist);
 void render_setup(struct frame *fr, const struct camera *cam, const struct view *v);
 
 /*
- * Draw rows [band * BAND_H, (band + 1) * BAND_H) of the frame into pixels
- * (a full SCREEN_W x SCREEN_H RGB332 buffer). zbuf is BAND_H * SCREEN_W
- * floats of scratch space private to the calling thread.
+ * The frame as GPU commands (gpu.h): render_prologue() writes region 0
+ * (colour sets, when they changed since the last call), render_band() the
+ * commands drawing rows [band * BAND_H, (band + 1) * BAND_H). Both return
+ * the number of 64-bit words written (at most cap, ending with END).
+ * Different bands may be built by different threads at the same time; the
+ * prologue only by the thread that calls render_set_env().
  */
-void render_band(const struct frame *fr, uint8_t *pixels, int band, float *zbuf);
+int render_prologue(uint64_t *cmd, int cap);
+int render_band(const struct frame *fr, int band, uint64_t *cmd, int cap);
+
+/* Put the colour sets into the next prologue again (e.g. after a GPU reset). */
+void render_resend_colors(void);
+
+extern int render_overflows;    /* bands whose commands did not all fit */
 
 #endif

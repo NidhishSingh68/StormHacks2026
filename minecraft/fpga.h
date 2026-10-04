@@ -26,6 +26,26 @@ uint32_t fpga_status(void);
  */
 int      fpga_setup_dma(uint8_t *const bufs[], int n);
 
+/*
+ * The span GPU (fpga/span_gpu.v), if the bitstream has one: it draws frames
+ * from command lists (gpu.h) straight into the framebuffer.
+ *
+ * fpga_gpu_open() locks the n (<= 2) command buffers, each GPU_BUF_SIZE
+ * bytes and page aligned, and loads their physical pages into the GPU's
+ * page table. Returns 0 if the GPU will draw. fpga_gpu_kick() queues the
+ * frame in buffer b, first waiting while another frame is still queued;
+ * fpga_gpu_done() counts finished frames (mod 2^16). The buffer of a
+ * queued frame must not be touched until it is done.
+ */
+int      fpga_gpu_open(uint64_t *const bufs[], int n);
+void     fpga_gpu_kick(int b);
+uint32_t fpga_gpu_done(void);
+void     fpga_gpu_close(void);
+
+/* Last frame: ms from start to end, ms spent drawing (not waiting for the
+ * display), bands copied out late (torn) since the last call. */
+void     fpga_gpu_stats(double *frame_ms, double *draw_ms, unsigned *late);
+
 /* Copy a full frame (SCREEN_SIZE bytes, 64-byte aligned) to the FPGA. */
 void     fpga_present(const uint8_t *frame);
 

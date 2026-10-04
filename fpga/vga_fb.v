@@ -29,7 +29,11 @@ module vga_fb #(
     output wire        vga_clk,
 
     // high while the beam is in the vertical blanking interval
-    output reg         vblank
+    output reg         vblank,
+
+    // where the beam is: [15:5] frames scanned (wraps), [4:0] 16-row bands
+    // fully scanned in this frame (0..29; 30 = vertical blanking)
+    output reg  [15:0] beam
 );
 
     // 640x480@60 timing (pixels / lines), negative sync polarity
@@ -52,6 +56,16 @@ module vga_fb #(
         end else begin
             hc <= hc + 10'd1;
         end
+    end
+
+    reg [10:0] scans;
+
+    always @(posedge clk) begin
+        if (!reset_n)
+            scans <= 11'd0;
+        else if (hc == H_TOTAL - 1 && vc == V_TOTAL - 1)
+            scans <= scans + 11'd1;
+        beam <= {scans, (vc >= V_VISIBLE) ? 5'd30 : vc[8:4]};
     end
 
     wire visible0 = (hc < H_VISIBLE) && (vc < V_VISIBLE);

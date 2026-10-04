@@ -9,8 +9,8 @@ CROSS   ?= $(HOME)/toolchains/arm-gnu-toolchain-14.2.rel1-x86_64-arm-none-linux-
 CC_ARM  := $(CROSS)gcc
 CC_HOST ?= gcc
 
-SRCS    := main.c world.c render.c fpga.c input.c terrain.c
-HDRS    := mc.h world.h render.h fpga.h input.h terrain.h
+SRCS    := main.c world.c render.c gpu_sw.c fpga.c input.c terrain.c
+HDRS    := mc.h world.h render.h gpu.h fpga.h input.h terrain.h
 WARN    := -Wall -Wextra
 
 ARM_FLAGS  := -O3 -mcpu=cortex-a9 -mfpu=neon -mfloat-abi=hard -ffast-math \

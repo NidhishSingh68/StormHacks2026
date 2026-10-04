@@ -32,6 +32,7 @@
 #include "render.h"
 #include "world.h"
 #include "font.h"
+#include "gpu.h"
 
 #define CX              (SCREEN_W * 0.5f)
 #define CY              (SCREEN_H * 0.5f)
@@ -42,25 +43,34 @@
 
 enum { FACE_TOP, FACE_BOTTOM, FACE_X, FACE_Z, NUM_FACES };
 enum { TONE_A, TONE_B, TONE_C, TONE_LINE, TONE_SEL, NUM_TONES };
-#define TONE_STRIDE     (FOG_LEVELS * 16)
 
 #define SKY_LEVELS      64
 #define SUN_CORE        18      /* half-size in pixels */
 #define SUN_HALO        28
 
+/*
+ * GPU colour sets: the five tones of each block face at each fog level.
+ * Block 0 (air) is never drawn, so 16 blocks x 4 faces x 32 fog levels
+ * fill all 2048 sets exactly.
+ */
+#define SET_INDEX(b, f, fog)    ((((b) - 1) * NUM_FACES + (f)) * FOG_LEVELS + (fog))
+_Static_assert((NUM_BLOCK_TYPES - 1) * NUM_FACES * FOG_LEVELS == GPU_COLOR_SETS,
+               "colour sets must cover every block, face and fog level");
+_Static_assert(NUM_TONES == GPU_TONES, "tones");
+
 static float focal, fog_start, fog_scale;
 
-static uint8_t pal[NUM_BLOCK_TYPES][NUM_FACES][NUM_TONES][FOG_LEVELS][16];
-static uint8_t sky_lut[SKY_LEVELS][16];
-static uint8_t sun_lut[2][16];
-static uint8_t water_tint[256];
+static uint32_t set_rgb[GPU_COLOR_SETS][NUM_TONES];
+static int sets_dirty;                  /* not yet sent to the GPU */
+static uint32_t sky_rgb[SKY_LEVELS];
+static uint32_t sun_c[2], moon_c[2], star_c, rain_c, snow_c, water_fog_rgb;
+int render_overflows;                   /* bands that ran out of command space */
 
-static const uint8_t bayer[16] = {
-     0,  8,  2, 10,
-    12,  4, 14,  6,
-     3, 11,  1,  9,
-    15,  7, 13,  5,
-};
+/* underwater: everything seen through murky water */
+#define WATER_FOG_ALPHA 179
+/* hotbar slots: darkened backdrop */
+#define HUD_BACK_RGB    0x0A1430u
+#define HUD_BACK_ALPHA  150
 
 /* block colours: top, bottom, sides (before directional light) */
 static const float block_rgb[NUM_BLOCK_TYPES][3][3] = {
@@ -88,8 +98,8 @@ static const float block_rgb[NUM_BLOCK_TYPES][3][3] = {
  */
 enum { MAT_WATER, MAT_GLASS, NUM_MATS };
 static const float mat_rgb[NUM_MATS][3] = { { 36, 84, 205 }, { 220, 240, 255 } };
-static const float mat_alpha[NUM_MATS]  = { 0.6f, 0.22f };
-static uint8_t blend_lut[NUM_MATS][FOG_LEVELS][256];
+static const uint8_t mat_alpha8[NUM_MATS] = { 154, 56 };   /* 0.6, 0.22 */
+static uint32_t mat_fog_rgb[NUM_MATS][FOG_LEVELS];
 
 /* hotbar contents and names (main.c maps stairs to a facing) */
 const uint8_t hotbar_blocks[HOTBAR_SLOTS] = {
@@ -100,8 +110,8 @@ static const char *const hotbar_names[HOTBAR_SLOTS] = {
     "COBBLESTONE", "DIRT", "GRASS", "GLASS", "LOG", "PLANKS", "STAIRS",
 };
 #define ICON            32
-static uint8_t icons[HOTBAR_SLOTS][ICON * ICON];
-static uint8_t icon_on[HOTBAR_SLOTS][ICON * ICON];      /* pixel is part of it */
+#define ICON_OFF        0xFFFFFFFFu                     /* not part of the icon */
+static uint32_t icons[HOTBAR_SLOTS][ICON * ICON];
 
 /* water is a flat surface: no grid lines, no per-block tones */
 static const uint8_t block_plain[NUM_BLOCK_TYPES] = { [BLOCK_WATER] = 1 };
@@ -120,26 +130,6 @@ static const float water_fog[3]   = {  30,  60, 150 };
 static float sun_dir[3] = { 0.25f, 0.42f, -0.87f };
 static float moon_dir[3];
 static float star_dir[NUM_STARS][3];
-static uint8_t moon_lut[2][16], star_lut[16], rain_lut[16], snow_lut[16];
-
-/* hash bits -> block tone */
-static const uint8_t tone_map[4] = { TONE_A, TONE_B, TONE_C, TONE_A };
-
-static uint8_t quantize(const float c[3], int k)
-{
-    float t = (bayer[k] + 0.5f) * (1.0f / 16.0f);
-    int r = (int)(c[0] * (7.0f / 255.0f) + t);
-    int g = (int)(c[1] * (7.0f / 255.0f) + t);
-    int b = (int)(c[2] * (3.0f / 255.0f) + t);
-
-    if (r > 7) r = 7;
-    if (g > 7) g = 7;
-    if (b > 3) b = 3;
-    if (r < 0) r = 0;
-    if (g < 0) g = 0;
-    if (b < 0) b = 0;
-    return (uint8_t)((r << 5) | (g << 2) | b);
-}
 
 static void mix(float out[3], const float a[3], const float b[3], float t)
 {
@@ -152,6 +142,11 @@ static void mix(float out[3], const float a[3], const float b[3], float t)
 static float clamp255(float v)
 {
     return v < 0.0f ? 0.0f : v > 255.0f ? 255.0f : v;
+}
+
+static uint32_t rgbf(const float c[3])
+{
+    return gpu_rgb(c[0], c[1], c[2]);
 }
 
 /*
@@ -169,7 +164,6 @@ static void make_icons(void)
             for (x = 0; x < ICON; x++) {
                 float c[3], shade = 0.0f, fx = x + 0.5f, fy = y + 0.5f;
                 const float *base = NULL;
-                int bk = (y & 3) * 4 + (x & 3);
 
                 if (block_is_stairs(b)) {
                     /* side view of a step: full bottom half, right top half */
@@ -194,7 +188,7 @@ static void make_icons(void)
                     shade = 0.62f;
                 }
 
-                icon_on[i][y * ICON + x] = base != NULL;
+                icons[i][y * ICON + x] = ICON_OFF;
                 if (!base)
                     continue;
                 for (k = 0; k < 3; k++)
@@ -207,29 +201,9 @@ static void make_icons(void)
                     for (k = 0; k < 3; k++)
                         c[k] = frame ? 245.0f : c[k] * 0.55f + 60.0f;
                 }
-                icons[i][y * ICON + x] = quantize(c, bk);
+                icons[i][y * ICON + x] = rgbf(c);
             }
         }
-    }
-}
-
-/* All 16 dithered RGB332 versions of one colour. */
-static void quantize16(const float c[3], uint8_t out[16])
-{
-    float r = c[0] * (7.0f / 255.0f), g = c[1] * (7.0f / 255.0f), b = c[2] * (3.0f / 255.0f);
-    int k;
-
-    for (k = 0; k < 16; k++) {
-        float t = (bayer[k] + 0.5f) * (1.0f / 16.0f);
-        int ri = (int)(r + t), gi = (int)(g + t), bi = (int)(b + t);
-
-        if (ri > 7) ri = 7;
-        if (gi > 7) gi = 7;
-        if (bi > 3) bi = 3;
-        if (ri < 0) ri = 0;
-        if (gi < 0) gi = 0;
-        if (bi < 0) bi = 0;
-        out[k] = (uint8_t)((ri << 5) | (gi << 2) | bi);
     }
 }
 
@@ -306,20 +280,21 @@ void render_set_env(const struct env *e)
                     float c[3];
 
                     mix(c, lit, fogc, (float)l / (FOG_LEVELS - 1));
-                    quantize16(c, pal[b][f][t][l]);
+                    set_rgb[SET_INDEX(b, f, l)][t] = rgbf(c);
                 }
             }
         }
     }
+    sets_dirty = 1;
 
     for (l = 0; l < SKY_LEVELS; l++) {
         float c[3];
 
         mix(c, e->sky_horizon, e->sky_zenith, (float)l / (SKY_LEVELS - 1));
-        quantize16(c, sky_lut[l]);
+        sky_rgb[l] = rgbf(c);
     }
 
-    /* see-through blocks: background colour -> colour seen through them */
+    /* see-through blocks: the colour things behind them are blended towards */
     for (b = 0; b < NUM_MATS; b++) {
         for (l = 0; l < FOG_LEVELS; l++) {
             float m[3], lit[3];
@@ -327,14 +302,7 @@ void render_set_env(const struct env *e)
             for (k = 0; k < 3; k++)
                 lit[k] = mat_rgb[b][k] * e->light;
             mix(m, lit, fogc, (float)l / (FOG_LEVELS - 1));
-            for (k = 0; k < 256; k++) {
-                float c[3] = { (float)((k >> 5) * 255 / 7),
-                               (float)(((k >> 2) & 7) * 255 / 7),
-                               (float)((k & 3) * 85) };
-
-                mix(c, c, m, mat_alpha[b]);
-                blend_lut[b][l][k] = quantize(c, 5);
-            }
+            mat_fog_rgb[b][l] = rgbf(m);
         }
     }
 }
@@ -348,22 +316,14 @@ void render_init(int render_dist)
     focal = CX / tanf(FOV_X_DEG * 0.5f * (float)M_PI / 180.0f);
     render_range = (float)(render_dist * CHUNK_SIZE);
 
-    for (l = 0; l < 2; l++)
-        quantize16(sun_rgb[l], sun_lut[l]);
-    for (l = 0; l < 2; l++)
-        quantize16(moon_rgb[l], moon_lut[l]);
-    quantize16(star_rgb, star_lut);
-    quantize16(rain_rgb, rain_lut);
-    quantize16(snow_rgb, snow_lut);
-
-    /* RGB332 -> same colour seen through water */
-    for (k = 0; k < 256; k++) {
-        float c[3] = { (float)((k >> 5) * 255 / 7), (float)(((k >> 2) & 7) * 255 / 7),
-                       (float)((k & 3) * 85) };
-
-        mix(c, c, water_fog, 0.7f);
-        water_tint[k] = quantize(c, 5);
+    for (l = 0; l < 2; l++) {
+        sun_c[l] = rgbf(sun_rgb[l]);
+        moon_c[l] = rgbf(moon_rgb[l]);
     }
+    star_c = rgbf(star_rgb);
+    rain_c = rgbf(rain_rgb);
+    snow_c = rgbf(snow_rgb);
+    water_fog_rgb = rgbf(water_fog);
 
     len = sqrtf(sun_dir[0] * sun_dir[0] + sun_dir[1] * sun_dir[1] +
                 sun_dir[2] * sun_dir[2]);
@@ -723,7 +683,28 @@ void render_setup(struct frame *fr, const struct camera *cam, const struct view 
     }
 }
 
-/* ---- band rendering ------------------------------------------------------ */
+
+/* ---- band command lists ---------------------------------------------------- */
+
+/* Where a band's commands go; cap leaves room for the final END. */
+struct cmds {
+    uint64_t *p;
+    int n, cap;
+    int full;                   /* something did not fit */
+};
+
+static inline uint64_t *put(struct cmds *c, int words)
+{
+    uint64_t *w;
+
+    if (c->n + words > c->cap) {
+        c->full = 1;
+        return NULL;
+    }
+    w = c->p + c->n;
+    c->n += words;
+    return w;
+}
 
 static inline int fog_index(float z)
 {
@@ -736,76 +717,64 @@ static inline int fog_index(float z)
     return (int)f;
 }
 
-static inline int32_t float_bits(float f)
+static inline int32_t fixed16(float v)
 {
-    union { float f; int32_t i; } u;
-
-    u.f = f;
-    return u.i;
+    return (int32_t)(v * 65536.0f);
 }
 
-static inline unsigned block_tone(int32_t bu, int32_t bv)
+static void fill(struct cmds *c, int y, int x0, int x1, uint32_t rgb)
 {
-    uint32_t h = (uint32_t)bu * 0x9E3779B1u + (uint32_t)bv * 0x85EBCA77u;
+    uint64_t *w;
 
-    /* mix so the top bits depend on every input bit */
-    h ^= h >> 15;
-    h *= 0x2C1B3C6Du;
-    h ^= h >> 12;
-    return tone_map[h >> 30];
+    if (x0 < 0) x0 = 0;
+    if (x1 > SCREEN_W) x1 = SCREEN_W;
+    if (x0 >= x1 || !(w = put(c, 2)))
+        return;
+    w[0] = gpu_hdr(GPU_FILL, x0, x1, y);
+    w[1] = rgb;
+}
+
+/* fill behind anything nearer than 1/z = iz */
+static void fill_z(struct cmds *c, int y, int x0, int x1, uint32_t rgb, float iz)
+{
+    uint64_t *w;
+
+    if (x0 < 0) x0 = 0;
+    if (x1 > SCREEN_W) x1 = SCREEN_W;
+    if (x0 >= x1 || !(w = put(c, 2)))
+        return;
+    w[0] = gpu_hdr(GPU_FILL, x0, x1, y) | GPU_FLAG;
+    w[1] = gpu_pair(rgb, gpu_iz(iz));
+}
+
+/* see-through overlay of a whole run, no grid lines, no depth test */
+static void tint(struct cmds *c, int y, int x0, int x1, uint32_t rgb, int alpha)
+{
+    uint64_t *w;
+
+    if (x0 >= x1 || !(w = put(c, 6)))
+        return;
+    w[0] = gpu_hdr(GPU_BLEND, x0, x1, y);
+    w[1] = w[2] = w[3] = 0;
+    w[4] = (uint64_t)rgb << 16 | (uint64_t)alpha << 40;
+    w[5] = 0;
 }
 
 /*
- * Shade pixels x0..x1 of a span given 16.16 fixed-point world coordinates
- * (ua, ub) along the face's two in-plane axes and their per-pixel steps.
- * ZEXPR gives this pixel's 1/z as float bits (positive floats compare like
- * integers); ZSTEP advances it to the next pixel.
+ * A span of a horizontal face: 1/z is constant across it, and the world
+ * coordinates step by a constant per pixel.
  */
-#define SHADE_SPAN(ZEXPR, ZSTEP)                                            \
-    {                                                                       \
-        int32_t cba = INT32_MIN, cbb = 0;   /* block of the cached tone */  \
-        unsigned ct = TONE_A;                                               \
-                                                                            \
-        for (x = x0; x < x1; x++, ua += dua, ub += dub, ZSTEP) {            \
-            int32_t zb = (ZEXPR), ba, bb;                                   \
-            unsigned t;                                                     \
-                                                                            \
-            if (zrow[x] >= zb)                                              \
-                continue;                                                   \
-            zrow[x] = zb;                                                   \
-            ba = ua >> 16;                                                  \
-            bb = ub >> 16;                                                  \
-            if (((uint32_t)ua & 0xFFFF) < la || ((uint32_t)ub & 0xFFFF) < lb) { \
-                t = TONE_LINE;                                              \
-            } else {                                                        \
-                /* neighbouring pixels are nearly always the same block */  \
-                if (ba != cba || bb != cbb) {                               \
-                    cba = ba;                                               \
-                    cbb = bb;                                               \
-                    ct = (sel && ba == sela && bb == selb) ? TONE_SEL       \
-                                                           : block_tone(ba, bb); \
-                }                                                           \
-                t = ct;                                                     \
-            }                                                               \
-            row[x] = lut[t * TONE_STRIDE + (x & 3)];                        \
-        }                                                                   \
-    }
-
-/* A span of a horizontal face: 1/z is constant across it. */
-static void span_flat(const struct frame *fr, const struct poly *p,
-                      uint8_t *row, int32_t *zrow, int y, int x0, int x1)
+static void span_flat(struct cmds *c, const struct frame *fr, const struct poly *p,
+                      int y, int x0, int x1)
 {
     float pyc = y + 0.5f, px = x0 + 0.5f;
     float invz = p->ia + p->ic * pyc;
     float z, z2, bx, bz, wx, wz, sx, sz, fx, fz;
-    const uint8_t *lut;
-    int32_t zbits;
-    int x;
+    uint64_t *w, hdr, set;
 
     if (invz <= 1e-6f)
         return;
     z = 1.0f / invz;
-    zbits = float_bits(invz);
 
     /* world x and z of the first pixel, and their change per pixel */
     bx = fr->dk0[0] + fr->dky[0] * pyc;
@@ -822,113 +791,52 @@ static void span_flat(const struct frame *fr, const struct poly *p,
     if (fabsf(sx) > fx) fx = fabsf(sx);
     if (fabsf(sz) > fz) fz = fabsf(sz);
 
-    lut = &pal[p->block][p->face][0][fog_index(z)][(y & 3) * 4];
-
+    set = (uint64_t)SET_INDEX(p->block, p->face, fog_index(z)) << 35;
     if (block_plain[p->block] || fx > 0.3f || fz > 0.3f) {
         /* water, or blocks only a few pixels wide: plain colour */
-        for (x = x0; x < x1; x++) {
-            if (zrow[x] < zbits) {
-                zrow[x] = zbits;
-                row[x] = lut[x & 3];
-            }
+        if ((w = put(c, 2))) {
+            w[0] = gpu_hdr(GPU_SHADE, x0, x1, y) | set;
+            w[1] = gpu_pair(gpu_iz(invz), 0);
         }
         return;
     }
-
-    {
-        /* a = world x, b = world z */
-        int32_t ua = (int32_t)(wx * 65536.0f), ub = (int32_t)(wz * 65536.0f);
-        int32_t dua = (int32_t)(sx * 65536.0f), dub = (int32_t)(sz * 65536.0f);
-        uint32_t la = (uint32_t)(fx * 65536.0f), lb = (uint32_t)(fz * 65536.0f);
-        int sel = p->sel, sela = fr->sel[0], selb = fr->sel[2];
-
-        SHADE_SPAN(zbits, (void)0)
-    }
-}
-
-/* A span of a vertical face: perspective-correct every 8 pixels. */
-static void span_wall(const struct frame *fr, const struct poly *p,
-                      uint8_t *row, int32_t *zrow, int y, int sx0, int sx1)
-{
-    int ka = (p->axis + 1) % 3, kb = (p->axis + 2) % 3;
-    float pyc = y + 0.5f;
-    float iz_row = p->ia + p->ic * pyc;
-    float ba = fr->dk0[ka] + fr->dky[ka] * pyc;
-    float bb = fr->dk0[kb] + fr->dky[kb] * pyc;
-    int sel = p->sel, sela = fr->sel[ka], selb = fr->sel[kb];
-    int xs;
-
-    for (xs = sx0; xs < sx1; xs += 8) {
-        int xe = (xs + 8 < sx1) ? xs + 8 : sx1, n = xe - xs, x, x0 = xs, x1 = xe;
-        float pa = xs + 0.5f, pb = xe + 0.5f;
-        float izs = iz_row + p->ib * pa, ize = iz_row + p->ib * pb;
-        float zs, ze, was, wae, wbs, wbe, sa, sb, fa, fb, iz;
-        const uint8_t *lut;
-
-        if (izs < 1e-6f) izs = 1e-6f;
-        if (ize < 1e-6f) ize = 1e-6f;
-        zs = 1.0f / izs;
-        ze = 1.0f / ize;
-        was = fr->eye[ka] + zs * (ba + fr->dkx[ka] * pa);
-        wae = fr->eye[ka] + ze * (ba + fr->dkx[ka] * pb);
-        wbs = fr->eye[kb] + zs * (bb + fr->dkx[kb] * pa);
-        wbe = fr->eye[kb] + ze * (bb + fr->dkx[kb] * pb);
-        sa = (wae - was) / n;
-        sb = (wbe - wbs) / n;
-
-        /* footprint: along the span, or one pixel's worth at this depth */
-        fa = fabsf(sa); if (zs / focal > fa) fa = zs / focal;
-        fb = fabsf(sb); if (zs / focal > fb) fb = zs / focal;
-
-        lut = &pal[p->block][p->face][0][fog_index(zs)][(y & 3) * 4];
-        iz = izs;
-
-        if (block_plain[p->block] || fa > 0.3f || fb > 0.3f) {
-            for (x = xs; x < xe; x++, iz += p->ib) {
-                int32_t zb = float_bits(iz);
-
-                if (zrow[x] < zb) {
-                    zrow[x] = zb;
-                    row[x] = lut[x & 3];
-                }
-            }
-            continue;
-        }
-
-        {
-            int32_t ua = (int32_t)(was * 65536.0f), ub = (int32_t)(wbs * 65536.0f);
-            int32_t dua = (int32_t)(sa * 65536.0f), dub = (int32_t)(sb * 65536.0f);
-            uint32_t la = (uint32_t)(fa * 65536.0f), lb = (uint32_t)(fb * 65536.0f);
-
-            SHADE_SPAN(float_bits(iz), iz += p->ib)
-        }
-    }
+    if (!(w = put(c, 5)))
+        return;
+    hdr = gpu_hdr(GPU_SPAN, x0, x1, y) | set;
+    w[1] = gpu_pair(gpu_iz(invz), 0);
+    /* a = world x, b = world z */
+    w[0] = hdr | (p->sel ? GPU_FLAG : 0) | (uint64_t)(uint16_t)fixed16(fx) << 48;
+    w[2] = gpu_pair((uint32_t)fixed16(wx), (uint32_t)fixed16(sx));
+    w[3] = gpu_pair((uint32_t)fixed16(wz), (uint32_t)fixed16(sz));
+    w[4] = (uint64_t)(uint16_t)fixed16(fz) | (uint64_t)(uint16_t)fr->sel[0] << 16 |
+           (uint64_t)(uint16_t)fr->sel[2] << 32;
 }
 
 /*
- * A span of a see-through face (water, glass): depth-tested against what is
- * already drawn but not written, and blended over it. Works for any face
- * orientation, perspective-correct every 16 pixels.
+ * A span of a vertical or see-through face, cut into pieces of SUBSPAN
+ * pixels: exact 1/z, world coordinates perspective-correct at the ends of
+ * each piece and linear in between.
  */
-static void span_trans(const struct frame *fr, const struct poly *p,
-                       uint8_t *row, const int32_t *zrow, int y, int sx0, int sx1)
+#define SUBSPAN         16
+
+static void span_wall(struct cmds *c, const struct frame *fr, const struct poly *p,
+                      int y, int sx0, int sx1)
 {
     int ka = (p->axis + 1) % 3, kb = (p->axis + 2) % 3;
-    int mat = (p->block == BLOCK_GLASS) ? MAT_GLASS : MAT_WATER;
+    int trans = p->trans, mat = (p->block == BLOCK_GLASS) ? MAT_GLASS : MAT_WATER;
     float pyc = y + 0.5f;
     float iz_row = p->ia + p->ic * pyc;
     float ba = fr->dk0[ka] + fr->dky[ka] * pyc;
     float bb = fr->dk0[kb] + fr->dky[kb] * pyc;
+    uint32_t diz = gpu_iz(p->ib);
     int xs;
 
-    for (xs = sx0; xs < sx1; xs += 16) {
-        int xe = (xs + 16 < sx1) ? xs + 16 : sx1, n = xe - xs, x, fog;
+    for (xs = sx0; xs < sx1; xs += SUBSPAN) {
+        int xe = (xs + SUBSPAN < sx1) ? xs + SUBSPAN : sx1, n = xe - xs, set;
         float pa = xs + 0.5f, pb = xe + 0.5f;
-        float izs = iz_row + p->ib * pa, ize = iz_row + p->ib * pb, iz = izs;
+        float izs = iz_row + p->ib * pa, ize = iz_row + p->ib * pb;
         float zs, ze, was, wbs, sa, sb, fa, fb;
-        const uint8_t *blend, *line;
-        int32_t ua, ub, dua, dub;
-        uint32_t la = 0, lb = 0;
+        uint64_t *w, hdr;
 
         if (izs < 1e-6f) izs = 1e-6f;
         if (ize < 1e-6f) ize = 1e-6f;
@@ -938,61 +846,81 @@ static void span_trans(const struct frame *fr, const struct poly *p,
         wbs = fr->eye[kb] + zs * (bb + fr->dkx[kb] * pa);
         sa = (fr->eye[ka] + ze * (ba + fr->dkx[ka] * pb) - was) / n;
         sb = (fr->eye[kb] + ze * (bb + fr->dkx[kb] * pb) - wbs) / n;
-        fog = fog_index(zs);
-        blend = blend_lut[mat][fog];
-        line = &pal[p->block][p->face][TONE_LINE][fog][(y & 3) * 4];
 
-        /* glass frame lines, while blocks are big enough to show them */
+        /* footprint: along the span, or one pixel's worth at this depth */
         fa = fabsf(sa); if (zs / focal > fa) fa = zs / focal;
         fb = fabsf(sb); if (zs / focal > fb) fb = zs / focal;
-        if (mat == MAT_GLASS && fa < 0.3f && fb < 0.3f) {
-            la = (uint32_t)(fa * 65536.0f);
-            lb = (uint32_t)(fb * 65536.0f);
-        }
-        ua = (int32_t)(was * 65536.0f);
-        ub = (int32_t)(wbs * 65536.0f);
-        dua = (int32_t)(sa * 65536.0f);
-        dub = (int32_t)(sb * 65536.0f);
+        set = SET_INDEX(p->block, p->face, fog_index(zs));
 
-        for (x = xs; x < xe; x++, iz += p->ib, ua += dua, ub += dub) {
-            if (zrow[x] >= float_bits(iz))
+        if (trans) {
+            int fog = fog_index(zs);
+
+            if (!(w = put(c, 6)))
+                return;
+            w[0] = gpu_hdr(GPU_BLEND, xs, xe, y) | GPU_FLAG;
+            w[4] = (uint64_t)mat_fog_rgb[mat][fog] << 16 | (uint64_t)mat_alpha8[mat] << 40;
+            w[5] = set_rgb[set][TONE_LINE];
+            /* glass frame lines, while blocks are big enough to show them */
+            if (mat == MAT_GLASS && fa < 0.3f && fb < 0.3f) {
+                w[0] |= (uint64_t)(uint16_t)fixed16(fa) << 48;
+                w[4] |= (uint16_t)fixed16(fb);
+            }
+        } else {
+            if (block_plain[p->block] || fa > 0.3f || fb > 0.3f) {
+                if (!(w = put(c, 2)))
+                    return;
+                w[0] = gpu_hdr(GPU_SHADE, xs, xe, y) | (uint64_t)set << 35;
+                w[1] = gpu_pair(gpu_iz(izs), diz);
                 continue;
-            if (((uint32_t)ua & 0xFFFF) < la || ((uint32_t)ub & 0xFFFF) < lb)
-                row[x] = line[x & 3];
-            else
-                row[x] = blend[row[x]];
+            }
+            if (!(w = put(c, 5)))
+                return;
+            hdr = gpu_hdr(GPU_SPAN, xs, xe, y) | (uint64_t)set << 35;
+            w[0] = hdr | (p->sel ? GPU_FLAG : 0) | (uint64_t)(uint16_t)fixed16(fa) << 48;
+            w[4] = (uint64_t)(uint16_t)fixed16(fb) | (uint64_t)(uint16_t)fr->sel[ka] << 16 |
+                   (uint64_t)(uint16_t)fr->sel[kb] << 32;
         }
+        w[1] = gpu_pair(gpu_iz(izs), diz);
+        w[2] = gpu_pair((uint32_t)fixed16(was), (uint32_t)fixed16(sa));
+        w[3] = gpu_pair((uint32_t)fixed16(wbs), (uint32_t)fixed16(sb));
     }
 }
 
 /* ---- HUD ------------------------------------------------------------------ */
 
-static void put_px(uint8_t *pixels, int y0, int y1, int x, int y, uint8_t c)
+/*
+ * Row y of text at (x, ty), each font pixel scale x scale, with a 1-pixel
+ * shadow: the shadow runs, then the text runs over them.
+ */
+static void text_row(struct cmds *c, int y, int x, int ty, const char *s, int scale,
+                     uint32_t rgb)
 {
-    if (y >= y0 && y < y1 && x >= 0 && x < SCREEN_W)
-        pixels[y * SCREEN_W + x] = c;
-}
+    int pass;
 
-/* Text at (x, y), each font pixel scale x scale, with a 1-pixel shadow. */
-static void draw_text(uint8_t *pixels, int y0, int y1, int x, int y,
-                      const char *s, int scale, uint8_t color)
-{
-    for (; *s; s++, x += 6 * scale) {
-        const uint8_t *g = font_glyph(*s);
-        int r, c, i, j;
+    for (pass = 0; pass < 2; pass++) {
+        int d = pass ? 0 : 1, gy = y - ty - d, cx;
+        const char *q;
 
-        if (!g)
+        if (gy < 0 || gy >= 7 * scale)
             continue;
-        for (r = 0; r < 7; r++)
-            for (c = 0; c < 5; c++)
-                if (g[r] & (0x10 >> c))
-                    for (j = 0; j < scale; j++)
-                        for (i = 0; i < scale; i++) {
-                            put_px(pixels, y0, y1, x + c * scale + i + 1,
-                                   y + r * scale + j + 1, 0x00);
-                            put_px(pixels, y0, y1, x + c * scale + i,
-                                   y + r * scale + j, color);
-                        }
+        for (q = s, cx = x + d; *q; q++, cx += 6 * scale) {
+            const uint8_t *g = font_glyph(*q);
+            int col = 0;
+
+            if (!g)
+                continue;
+            while (col < 5) {
+                int start;
+
+                if (!(g[gy / scale] & (0x10 >> col))) {
+                    col++;
+                    continue;
+                }
+                for (start = col; col < 5 && (g[gy / scale] & (0x10 >> col)); col++)
+                    ;
+                fill(c, y, cx + start * scale, cx + col * scale, pass ? rgb : 0);
+            }
+        }
     }
 }
 
@@ -1001,49 +929,57 @@ static void draw_text(uint8_t *pixels, int y0, int y1, int x, int y,
 #define HOTBAR_W        (HOTBAR_SLOTS * SLOT + (HOTBAR_SLOTS - 1) * SLOT_GAP)
 #define HOTBAR_X        ((SCREEN_W - HOTBAR_W) / 2)
 #define HOTBAR_Y        (SCREEN_H - SLOT - 8)
+#define WHITE           0xFFFFFFu
 
-static void draw_hud(const struct frame *fr, uint8_t *pixels, int y0, int y1)
+static void hud_row(struct cmds *c, const struct frame *fr, int y)
 {
-    int i, x, y;
+    int i;
 
-    if (y0 < 24) {
-        draw_text(pixels, y0, y1, 8, 8, weather_name(fr->weather), 2, 0xFF);
+    if (y < 24) {
+        text_row(c, y, 8, 8, weather_name(fr->weather), 2, WHITE);
         if (fr->fps >= 0) {
             char buf[16];
             int w;
 
             snprintf(buf, sizeof(buf), "%d FPS", fr->fps);
             w = (int)strlen(buf) * 12 - 2;
-            draw_text(pixels, y0, y1, SCREEN_W - 8 - w, 8, buf, 2, 0xFF);
+            text_row(c, y, SCREEN_W - 8 - w, 8, buf, 2, WHITE);
         }
+        return;
     }
-    if (y1 <= HOTBAR_Y - 24)
+    if (y < HOTBAR_Y - 24)
         return;
 
-    for (i = 0; i < HOTBAR_SLOTS; i++) {
+    for (i = 0; i < HOTBAR_SLOTS && y >= HOTBAR_Y && y < HOTBAR_Y + SLOT; i++) {
         int sx = HOTBAR_X + i * (SLOT + SLOT_GAP), sel = (i == fr->hotbar);
-        char num[2] = { (char)('1' + i), 0 };
+        int border = sel ? 3 : 1, iy = y - HOTBAR_Y - (SLOT - ICON) / 2;
+        uint32_t edge = sel ? WHITE : 0;
 
-        for (y = HOTBAR_Y; y < HOTBAR_Y + SLOT; y++) {
-            if (y < y0 || y >= y1)
-                continue;
-            for (x = sx; x < sx + SLOT; x++) {
-                int border = sel ? 3 : 1;
-                int edge = x < sx + border || x >= sx + SLOT - border ||
-                           y < HOTBAR_Y + border || y >= HOTBAR_Y + SLOT - border;
-                int ix = x - sx - (SLOT - ICON) / 2, iy = y - HOTBAR_Y - (SLOT - ICON) / 2;
-                uint8_t *px = &pixels[y * SCREEN_W + x];
+        if (y < HOTBAR_Y + border || y >= HOTBAR_Y + SLOT - border) {
+            fill(c, y, sx, sx + SLOT, edge);
+            continue;
+        }
+        fill(c, y, sx, sx + border, edge);
+        fill(c, y, sx + SLOT - border, sx + SLOT, edge);
+        tint(c, y, sx + border, sx + SLOT - border, HUD_BACK_RGB, HUD_BACK_ALPHA);
+        if (iy >= 0 && iy < ICON) {
+            const uint32_t *row = icons[i] + iy * ICON;
+            int ix = 0, x0 = sx + (SLOT - ICON) / 2;
 
-                if (edge)
-                    *px = sel ? 0xFF : 0x00;
-                else if (ix >= 0 && ix < ICON && iy >= 0 && iy < ICON &&
-                         icon_on[i][iy * ICON + ix])
-                    *px = icons[i][iy * ICON + ix];
-                else
-                    *px = water_tint[*px] & 0x6D;   /* darkened backdrop */
+            while (ix < ICON) {
+                int start = ix;
+
+                while (ix < ICON && row[ix] == row[start])
+                    ix++;
+                if (row[start] != ICON_OFF)
+                    fill(c, y, x0 + start, x0 + ix, row[start]);
             }
         }
-        draw_text(pixels, y0, y1, sx + 3, HOTBAR_Y + 3, num, 1, 0xFF);
+    }
+    for (i = 0; i < HOTBAR_SLOTS; i++) {
+        char num[2] = { (char)('1' + i), 0 };
+
+        text_row(c, y, HOTBAR_X + i * (SLOT + SLOT_GAP) + 3, HOTBAR_Y + 3, num, 1, WHITE);
     }
 
     /* name of the selected block above the bar */
@@ -1051,143 +987,105 @@ static void draw_hud(const struct frame *fr, uint8_t *pixels, int y0, int y1)
         const char *name = hotbar_names[fr->hotbar];
         int w = (int)strlen(name) * 12 - 2;
 
-        draw_text(pixels, y0, y1, (SCREEN_W - w) / 2, HOTBAR_Y - 20, name, 2, 0xFF);
+        text_row(c, y, (SCREEN_W - w) / 2, HOTBAR_Y - 20, name, 2, WHITE);
     }
 }
 
-static void fill_row(uint8_t *row, const uint8_t pat[4])
-{
-    uint32_t v = (uint32_t)pat[0] | (uint32_t)pat[1] << 8 |
-                 (uint32_t)pat[2] << 16 | (uint32_t)pat[3] << 24;
-    uint32_t *w = (uint32_t *)row;
-    int i;
+/* ---- sky, sun, weather ------------------------------------------------------ */
 
-    for (i = 0; i < SCREEN_W / 4; i++)
-        w[i] = v;
+static void sky_row(struct cmds *c, const struct frame *fr, int y)
+{
+    float pyc = y + 0.5f;
+    float d0 = fr->dk0[0] + fr->dkx[0] * CX + fr->dky[0] * pyc;
+    float d1 = fr->dk0[1] + fr->dkx[1] * CX + fr->dky[1] * pyc;
+    float d2 = fr->dk0[2] + fr->dkx[2] * CX + fr->dky[2] * pyc;
+    float e = d1 / sqrtf(d0 * d0 + d1 * d1 + d2 * d2);
+    int l = (e <= 0.0f) ? 0 : (int)(sqrtf(e) * (SKY_LEVELS - 1));
+
+    if (l > SKY_LEVELS - 1)
+        l = SKY_LEVELS - 1;
+    fill(c, y, 0, SCREEN_W, sky_rgb[l]);
 }
 
-static void draw_sky(const struct frame *fr, uint8_t *pixels, int y0, int y1)
+static void square_row(struct cmds *c, int y, int cx, int cy, int half, uint32_t rgb)
 {
-    int y;
-
-    for (y = y0; y < y1; y++) {
-        float pyc = y + 0.5f;
-        float d0 = fr->dk0[0] + fr->dkx[0] * CX + fr->dky[0] * pyc;
-        float d1 = fr->dk0[1] + fr->dkx[1] * CX + fr->dky[1] * pyc;
-        float d2 = fr->dk0[2] + fr->dkx[2] * CX + fr->dky[2] * pyc;
-        float e = d1 / sqrtf(d0 * d0 + d1 * d1 + d2 * d2);
-        int l = (e <= 0.0f) ? 0 : (int)(sqrtf(e) * (SKY_LEVELS - 1));
-
-        if (l > SKY_LEVELS - 1)
-            l = SKY_LEVELS - 1;
-        fill_row(pixels + y * SCREEN_W, &sky_lut[l][(y & 3) * 4]);
-    }
+    if (y >= cy - half && y < cy + half)
+        fill(c, y, cx - half, cx + half, rgb);
 }
 
-static void draw_square(uint8_t *pixels, int y0, int y1, int cx, int cy,
-                        int half, const uint8_t *lut)
-{
-    int ya = cy - half, yb = cy + half, xa = cx - half, xb = cx + half, x, y;
-
-    if (ya < y0) ya = y0;
-    if (yb > y1) yb = y1;
-    if (xa < 0) xa = 0;
-    if (xb > SCREEN_W) xb = SCREEN_W;
-    for (y = ya; y < yb; y++)
-        for (x = xa; x < xb; x++)
-            pixels[y * SCREEN_W + x] = lut[(y & 3) * 4 + (x & 3)];
-}
-
-static void draw_crosshair(uint8_t *pixels, int y0, int y1)
-{
-    const int cx = SCREEN_W / 2, cy = SCREEN_H / 2, len = 7;
-    int x, y;
-
-    for (y = cy - len; y <= cy + len; y++)
-        if (y >= y0 && y < y1)
-            pixels[y * SCREEN_W + cx] ^= 0xFF;
-    if (cy >= y0 && cy < y1)
-        for (x = cx - len; x <= cx + len; x++)
-            if (x != cx)
-                pixels[cy * SCREEN_W + x] ^= 0xFF;
-}
-
-static void draw_stars(const struct frame *fr, uint8_t *pixels, int y0, int y1)
-{
-    int i;
-
-    for (i = 0; i < fr->nstars; i++) {
-        int x = fr->stars[i][0], y = fr->stars[i][1];
-
-        if (y >= y0 && y < y1)
-            pixels[y * SCREEN_W + x] = star_lut[(y & 3) * 4 + (x & 3)];
-    }
-}
-
-/* Rain streaks and snowflakes, hidden behind anything nearer. */
-static void draw_particles(const struct frame *fr, uint8_t *pixels, int y0, int y1,
-                           const int32_t *zb)
+/* Rain streaks and snowflakes in row y, hidden behind anything nearer. */
+static void particles_row(struct cmds *c, const struct frame *fr, int y)
 {
     int i;
 
     for (i = 0; i < fr->nparticles; i++) {
         const struct particle *pt = &fr->particles[i];
-        int32_t iz = float_bits(pt->iz);
 
         if (pt->rain) {
             int ya = pt->y1 < pt->y0 ? pt->y1 : pt->y0;
             int yb = pt->y1 < pt->y0 ? pt->y0 : pt->y1;
-            int y;
+            int x;
 
-            if (yb < y0 || ya >= y1)
+            if (y < ya || y > yb)
                 continue;
-            for (y = ya > y0 ? ya : y0; y <= yb && y < y1; y++) {
-                int x = (yb == ya) ? pt->x0
-                      : pt->x1 + (pt->x0 - pt->x1) * (y - pt->y1) / (pt->y0 - pt->y1);
-
-                if (x < 0 || x >= SCREEN_W || zb[(y - y0) * SCREEN_W + x] >= iz)
-                    continue;
-                pixels[y * SCREEN_W + x] = rain_lut[(y & 3) * 4 + (x & 3)];
-            }
-        } else {
-            int dx, dy;
-
-            for (dy = 0; dy < pt->size; dy++) {
-                int y = pt->y0 + dy;
-
-                if (y < y0 || y >= y1)
-                    continue;
-                for (dx = 0; dx < pt->size; dx++) {
-                    int x = pt->x0 + dx;
-
-                    if (x < 0 || x >= SCREEN_W || zb[(y - y0) * SCREEN_W + x] >= iz)
-                        continue;
-                    pixels[y * SCREEN_W + x] = snow_lut[(y & 3) * 4 + (x & 3)];
-                }
-            }
+            x = (yb == ya) ? pt->x0
+              : pt->x1 + (pt->x0 - pt->x1) * (y - pt->y1) / (pt->y0 - pt->y1);
+            fill_z(c, y, x, x + 1, rain_c, pt->iz);
+        } else if (y >= pt->y0 && y < pt->y0 + pt->size) {
+            fill_z(c, y, pt->x0, pt->x0 + pt->size, snow_c, pt->iz);
         }
     }
 }
 
-void render_band(const struct frame *fr, uint8_t *pixels, int band, float *zbuf)
+/* ---- band ------------------------------------------------------------------ */
+
+void render_resend_colors(void)
 {
+    sets_dirty = 1;
+}
+
+int render_prologue(uint64_t *cmd, int cap)
+{
+    int n = 0, s;
+
+    if (sets_dirty && cap > GPU_COLOR_SETS * 3) {
+        for (s = 0; s < GPU_COLOR_SETS; s++) {
+            const uint32_t *k = set_rgb[s];
+            uint64_t lo = (uint64_t)k[0] | (uint64_t)k[1] << 24 | (uint64_t)k[2] << 48;
+            uint64_t hi = (uint64_t)(k[2] >> 16) | (uint64_t)k[3] << 8 | (uint64_t)k[4] << 32;
+
+            cmd[n++] = (uint64_t)GPU_COLORS | (uint64_t)s << 35;
+            cmd[n++] = lo;
+            cmd[n++] = hi;
+        }
+        sets_dirty = 0;
+    }
+    cmd[n++] = GPU_END;
+    return n;
+}
+
+int render_band(const struct frame *fr, int band, uint64_t *cmd, int cap)
+{
+    struct cmds c = { cmd, 0, cap - 1, 0 };
     int y0 = band * BAND_H, y1 = y0 + BAND_H;
-    int32_t *zb = (int32_t *)zbuf;
     int i, y, pass;
 
-    draw_sky(fr, pixels, y0, y1);
-    draw_stars(fr, pixels, y0, y1);
-    if (fr->sun_visible) {
-        draw_square(pixels, y0, y1, fr->sun_x, fr->sun_y, SUN_HALO, sun_lut[0]);
-        draw_square(pixels, y0, y1, fr->sun_x, fr->sun_y, SUN_CORE, sun_lut[1]);
-    }
-    if (fr->moon_visible) {
-        draw_square(pixels, y0, y1, fr->moon_x, fr->moon_y, SUN_CORE + 4, moon_lut[0]);
-        draw_square(pixels, y0, y1, fr->moon_x, fr->moon_y, SUN_CORE - 4, moon_lut[1]);
-    }
+    cmd[c.n++] = gpu_hdr(GPU_BAND, band, 0, y0);
 
-    /* 1/z of 0 means "infinitely far": anything drawn is in front */
-    memset(zb, 0, BAND_H * SCREEN_W * sizeof(*zb));
+    for (y = y0; y < y1; y++) {
+        sky_row(&c, fr, y);
+        for (i = 0; i < fr->nstars; i++)
+            if (fr->stars[i][1] == y)
+                fill(&c, y, fr->stars[i][0], fr->stars[i][0] + 1, star_c);
+        if (fr->sun_visible) {
+            square_row(&c, y, fr->sun_x, fr->sun_y, SUN_HALO, sun_c[0]);
+            square_row(&c, y, fr->sun_x, fr->sun_y, SUN_CORE, sun_c[1]);
+        }
+        if (fr->moon_visible) {
+            square_row(&c, y, fr->moon_x, fr->moon_y, SUN_CORE + 4, moon_c[0]);
+            square_row(&c, y, fr->moon_x, fr->moon_y, SUN_CORE - 4, moon_c[1]);
+        }
+    }
 
     /* pass 0: solid faces (writing depth), pass 1: see-through faces */
     for (pass = 0; pass < 2; pass++)
@@ -1220,24 +1118,36 @@ void render_band(const struct frame *fr, uint8_t *pixels, int band, float *zbuf)
             if (x0 >= x1)
                 continue;
 
-            if (p->trans)
-                span_trans(fr, p, pixels + y * SCREEN_W, zb + (y - y0) * SCREEN_W, y, x0, x1);
-            else if (p->axis == 1)
-                span_flat(fr, p, pixels + y * SCREEN_W, zb + (y - y0) * SCREEN_W, y, x0, x1);
+            if (p->axis == 1 && !p->trans)
+                span_flat(&c, fr, p, y, x0, x1);
             else
-                span_wall(fr, p, pixels + y * SCREEN_W, zb + (y - y0) * SCREEN_W, y, x0, x1);
+                span_wall(&c, fr, p, y, x0, x1);
         }
     }
 
-    if (fr->nparticles && !fr->underwater)
-        draw_particles(fr, pixels, y0, y1, zb);
+    for (y = y0; y < y1; y++) {
+        if (fr->nparticles && !fr->underwater)
+            particles_row(&c, fr, y);
+        if (fr->underwater)
+            tint(&c, y, 0, SCREEN_W, water_fog_rgb, WATER_FOG_ALPHA);
 
-    if (fr->underwater) {
-        uint8_t *px = pixels + y0 * SCREEN_W;
+        /* crosshair: inverted pixels */
+        if (y >= SCREEN_H / 2 - 7 && y <= SCREEN_H / 2 + 7) {
+            int x0 = SCREEN_W / 2, x1 = x0 + 1;
+            uint64_t *w;
 
-        for (i = 0; i < BAND_H * SCREEN_W; i++)
-            px[i] = water_tint[px[i]];
+            if (y == SCREEN_H / 2) {
+                x0 -= 7;
+                x1 += 7;
+            }
+            if ((w = put(&c, 1)))
+                w[0] = gpu_hdr(GPU_INVERT, x0, x1, y);
+        }
+        hud_row(&c, fr, y);
     }
-    draw_crosshair(pixels, y0, y1);
-    draw_hud(fr, pixels, y0, y1);
+
+    if (c.full)
+        __atomic_fetch_add(&render_overflows, 1, __ATOMIC_RELAXED);
+    cmd[c.n++] = GPU_END;
+    return c.n;
 }

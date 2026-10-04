@@ -4,15 +4,18 @@
  * Threads (one per Cortex-A9 core):
  *
  *   main (core 0)    input, movement, block breaking, chunk scheduling,
- *                    polygon setup, and rendering bands of the frame.
- *   worker (core 1)  presenting finished frames to the FPGA (started at the
- *                    first vblank after a frame is ready, racing the beam),
- *                    rendering bands of the next frame, and building and
- *                    meshing chunks when there is time.
+ *                    polygon setup, and building GPU commands for bands of
+ *                    the frame.
+ *   worker (core 1)  building commands for bands of the frame, and building
+ *                    and meshing chunks when there is time.
  *
- * Two back buffers in DDR: while the worker copies frame N to the FPGA, the
- * main thread already renders frame N + 1 into the other buffer, and the
- * worker joins in once its copy is done.
+ * The span GPU in the FPGA draws each frame from its command list (gpu.h)
+ * straight into the framebuffer. Two command buffers in DDR: while the GPU
+ * draws frame N, both cores build frame N + 1 in the other one.
+ *
+ * Without the GPU (older bitstream, --cpu, PC build), the cores also run the
+ * commands (gpu_sw.c) into two back buffers in DDR, and the worker copies
+ * finished frames to the FPGA at the first vblank after they are ready.
  *
  * Controls (USB keyboard / mouse on the board):
  *   W A S D    move                Space   jump / swim up (fly: up)
@@ -27,16 +30,18 @@
  *   Esc        quit
  *
  * Usage:
- *   sudo ./mc [--terrain FILE] [--dist N] [--weather NAME] [--auto]
+ *   sudo ./mc [--terrain FILE] [--dist N] [--weather NAME] [--auto] [--cpu]
  *       --terrain   terrain file (default terrain.bin; flat world if missing)
  *       --dist      render distance in chunks (default 8, max 15)
  *       --weather   force sunny, cloudy, night, snow or rain (default: the
  *                   weather stored in the terrain where you stand)
  *       --auto      walk forward and turn slowly on its own
- *   ./mc [--terrain FILE] [--dist N] [--break N] [--build] --shot X Y Z YAW PITCH out.ppm
+ *       --cpu       draw with the CPU even if the FPGA has the span GPU
+ *   ./mc [--terrain FILE] [--dist N] [--break N] [--build] [--dump FILE] --shot X Y Z YAW PITCH out.ppm
  *       render one frame from that eye position (degrees) and save it,
  *       after breaking the block under the crosshair N times, or placing
  *       one of each hotbar block in front of the camera (--build)
+ *       --dump FILE   also save the frame's GPU command buffer
  */
 
 #define _GNU_SOURCE
@@ -56,6 +61,7 @@
 #include "render.h"
 #include "fpga.h"
 #include "input.h"
+#include "gpu.h"
 
 #define EYE_HEIGHT      1.62f
 #define PLAYER_H        1.8f
@@ -99,7 +105,12 @@ static struct mesh_result results[JOB_QUEUE];
 static int res_head, res_tail;                  /* under job_lock */
 
 static struct frame frame;                      /* polygon list being drawn */
-static uint8_t *back[2];                        /* back buffers in DDR */
+static uint64_t *cmdbuf[2];                     /* GPU command lists in DDR */
+static uint8_t *back[2];                        /* back buffers (CPU drawing) */
+static int use_gpu;                             /* the FPGA draws the frames */
+static uint32_t gpu_frame[2];                   /* GPU frame number of each list */
+static uint32_t gpu_kicks;                      /* frames given to the GPU */
+static uint64_t *band_cmds;
 static uint8_t *band_pixels;
 static int band_next = NUM_BANDS;               /* next band to take */
 static int band_done;                           /* bands finished */
@@ -346,9 +357,11 @@ static int place_block(const int c[3], int slot, float yaw, const float *feet)
 
 /* ---- frame pipeline ------------------------------------------------------ */
 
-/* any thread: render one band of the current frame, if any is left */
-static int render_one_band(float *zbuf)
+/* any thread: build one band of the current frame, if any is left (and
+ * draw it, without the GPU) */
+static int render_one_band(uint32_t *zbuf)
 {
+    uint64_t *cmds;
     int b;
 
     if (__atomic_load_n(&band_next, __ATOMIC_ACQUIRE) >= NUM_BANDS)
@@ -356,14 +369,17 @@ static int render_one_band(float *zbuf)
     b = __atomic_fetch_add(&band_next, 1, __ATOMIC_ACQ_REL);
     if (b >= NUM_BANDS)
         return 0;
-    render_band(&frame, band_pixels, b, zbuf);
+    cmds = band_cmds + (size_t)(b + 1) * GPU_REGION_WORDS;
+    render_band(&frame, b, cmds, GPU_REGION_WORDS);
+    if (!use_gpu)
+        gpu_sw_region(cmds, GPU_REGION_WORDS, band_pixels, zbuf);
     __atomic_fetch_add(&band_done, 1, __ATOMIC_RELEASE);
     return 1;
 }
 
 static void *worker_main(void *arg)
 {
-    float *zbuf = aligned_alloc(64, BAND_H * SCREEN_W * sizeof(float));
+    uint32_t *zbuf = aligned_alloc(64, BAND_H * SCREEN_W * sizeof(uint32_t));
     uint32_t armed_count = 0, seen_count = fpga_status() & FPGA_FRAMES;
     double vblank_t = now_ms();
     int armed = 0;
@@ -414,9 +430,15 @@ static void *worker_main(void *arg)
     return NULL;
 }
 
-/* main thread: render the frame into buffer b with the worker's help */
-static void render_frame(int b, float *zbuf)
+/* main thread: build frame b's commands (and draw it, without the GPU)
+ * with the worker's help */
+static void render_frame(int b, uint32_t *zbuf)
 {
+    int n = render_prologue(cmdbuf[b], GPU_REGION_WORDS);
+
+    if (!use_gpu)
+        gpu_sw_region(cmdbuf[b], (uint32_t)n, back[b], zbuf);
+    band_cmds = cmdbuf[b];
     band_pixels = back[b];
     __atomic_store_n(&band_done, 0, __ATOMIC_RELAXED);
     __atomic_store_n(&band_next, 0, __ATOMIC_RELEASE);
@@ -733,11 +755,11 @@ static void run_all_jobs(void)
 }
 
 static int screenshot(const struct camera *cam, const char *path, int breaks, int build,
-                      int weather)
+                      int weather, const char *dump)
 {
-    float *zbuf = aligned_alloc(64, BAND_H * SCREEN_W * sizeof(float));
+    uint32_t *zbuf = aligned_alloc(64, BAND_H * SCREEN_W * sizeof(uint32_t));
     float dir[3];
-    int b, guard, hit[3], prev[3], has_hit;
+    int guard, hit[3], prev[3], has_hit;
     double t0, t1;
 
     /* load everything in range, running the jobs on this thread */
@@ -809,16 +831,44 @@ static int screenshot(const struct camera *cam, const char *path, int breaks, in
         double t2;
 
         t1 = now_ms();
+        if (guard == 19)
+            render_resend_colors();     /* the dumped frame is complete */
         render_setup(&frame, cam, &vw);
         t2 = now_ms();
-        for (b = 0; b < NUM_BANDS; b++)
-            render_band(&frame, back[0], b, zbuf);
-        if (guard == 19)
+        render_frame(0, zbuf);
+        if (guard == 19) {
+            int r, total = 0, most = 0;
+
             printf("loaded in %.0f ms; frame: %d polygons from %d chunks, "
-                   "setup %.2f ms + draw %.2f ms (one thread)\n",
+                   "setup %.2f ms + commands and CPU drawing %.2f ms (one thread)\n",
                    t1 - t0, frame.npolys, frame.nchunks, t2 - t1, now_ms() - t2);
+            for (r = 1; r < GPU_REGIONS; r++) {
+                const uint64_t *c = cmdbuf[0] + (size_t)r * GPU_REGION_WORDS;
+                int n = 0;
+
+                while ((c[n] & 15) != GPU_END)
+                    n += (c[n] & 15) == GPU_SPAN ? 5 : (c[n] & 15) == GPU_BLEND ? 6 :
+                         (c[n] & 15) == GPU_FILL || (c[n] & 15) == GPU_SHADE ? 2 :
+                         (c[n] & 15) == GPU_COLORS ? 3 : 1;
+                total += n + 1;
+                if (n + 1 > most)
+                    most = n + 1;
+            }
+            printf("GPU commands: %d KiB per frame, largest band %d KiB of %u\n",
+                   total * 8 / 1024, most * 8 / 1024, GPU_REGION / 1024);
+        }
     }
     free(zbuf);
+    if (dump) {
+        /* the last frame's commands, for testing the GPU (fpga/sim) */
+        FILE *f = fopen(dump, "wb");
+
+        if (!f || fwrite(cmdbuf[0], GPU_BUF_SIZE, 1, f) != 1) {
+            perror(dump);
+            return -1;
+        }
+        fclose(f);
+    }
     return write_ppm(path, back[0]);
 }
 
@@ -826,11 +876,12 @@ static void play(int autopilot, int forced_weather)
 {
     struct player pl;
     struct input in;
-    float *zbuf = aligned_alloc(64, BAND_H * SCREEN_W * sizeof(float));
+    uint32_t *zbuf = aligned_alloc(64, BAND_H * SCREEN_W * sizeof(uint32_t));
     pthread_t worker;
     double last, stat_t, stat_work = 0;
     float break_timer = 0.0f, place_timer = 0.0f, game_time = 0.0f;
     int cur = 0, stat_frames = 0, prev_f = 0, prev_y = 0, slot = 0;
+    uint32_t gpu_done = use_gpu ? fpga_gpu_done() : 0;
     struct weather_state ws;
     double fps_t = 0;               /* FPS counter: last sample time */
     int fps_shown = -1;             /* -1 until the first sample */
@@ -861,6 +912,15 @@ static void play(int autopilot, int forced_weather)
         if (dt > 0.1f)
             dt = 0.1f;
         game_time += dt;
+
+        /* frames the GPU finished count as shown */
+        if (use_gpu) {
+            uint32_t d = fpga_gpu_done(), n = (d - gpu_done) & 0xFFFF;
+
+            gpu_done = d;
+            __atomic_fetch_add(&fps_presents, (int)n, __ATOMIC_RELAXED);
+            __atomic_fetch_add(&stat_presents, (int)n, __ATOMIC_RELAXED);
+        }
 
         /* FPS counter: frames actually shown, averaged over half a second */
         if (t - fps_t >= 500.0) {
@@ -947,8 +1007,10 @@ static void play(int autopilot, int forced_weather)
                             : world_weather((int)floorf(pl.feet[0]), (int)floorf(pl.feet[2])),
                        dt);
 
-        /* wait until this buffer has been shown */
+        /* wait until this buffer has been shown (or drawn by the GPU) */
         while (__atomic_load_n(&buf_busy[cur], __ATOMIC_ACQUIRE) && !quitting())
+            sched_yield();
+        while (use_gpu && (int16_t)(fpga_gpu_done() - gpu_frame[cur]) < 0 && !quitting())
             sched_yield();
 
         w0 = now_ms();
@@ -961,23 +1023,38 @@ static void play(int autopilot, int forced_weather)
         render_frame(cur, zbuf);
         stat_work += now_ms() - w0;
 
-        /* hand it to the worker for the next vblank */
-        while (__atomic_load_n(&present_buf, __ATOMIC_ACQUIRE) >= 0 && !quitting())
-            sched_yield();
-        __atomic_store_n(&buf_busy[cur], 1, __ATOMIC_RELAXED);
-        __atomic_store_n(&present_buf, cur, __ATOMIC_RELEASE);
+        if (use_gpu) {
+            /* the GPU draws it as soon as it is done with the last one */
+            fpga_gpu_kick(cur);
+            gpu_frame[cur] = ++gpu_kicks & 0xFFFF;
+        } else {
+            /* hand it to the worker for the next vblank */
+            while (__atomic_load_n(&present_buf, __ATOMIC_ACQUIRE) >= 0 && !quitting())
+                sched_yield();
+            __atomic_store_n(&buf_busy[cur], 1, __ATOMIC_RELAXED);
+            __atomic_store_n(&present_buf, cur, __ATOMIC_RELEASE);
+        }
         cur ^= 1;
         stat_frames++;
 
         if (t - stat_t >= 2000.0) {
             int pres = __atomic_exchange_n(&stat_presents, 0, __ATOMIC_RELAXED);
             int cus = __atomic_exchange_n(&stat_copy_us, 0, __ATOMIC_RELAXED);
-            double secs = (t - stat_t) / 1000.0;
+            double secs = (t - stat_t) / 1000.0, gpu_ms = 0, draw_ms = 0;
+            unsigned late = 0;
 
-            printf("%5.1f fps | setup+draw %4.1f ms | copy %4.1f ms | %4d polys %3d chunks"
-                   " | pos %.1f %.1f %.1f | %s%s%s\n",
-                   pres / secs, stat_work / stat_frames,
-                   pres ? cus / 1000.0 / pres : 0.0, frame.npolys, frame.nchunks,
+            if (use_gpu) {
+                fpga_gpu_stats(&gpu_ms, &draw_ms, &late);
+                printf("%5.1f fps | CPU %4.1f ms | GPU %4.1f ms, drawing %4.1f ms, %u late bands"
+                       " | %4d polys %3d chunks",
+                       pres / secs, stat_work / stat_frames, gpu_ms, draw_ms, late,
+                       frame.npolys, frame.nchunks);
+            } else {
+                printf("%5.1f fps | CPU draw %4.1f ms | copy %4.1f ms | %4d polys %3d chunks",
+                       pres / secs, stat_work / stat_frames,
+                       pres ? cus / 1000.0 / pres : 0.0, frame.npolys, frame.nchunks);
+            }
+            printf(" | pos %.1f %.1f %.1f | %s%s%s\n",
                    pl.feet[0], pl.feet[1], pl.feet[2], weather_name(ws.shown),
                    pl.flying ? " flying" : "", pl.in_water ? " swimming" : "");
             fflush(stdout);
@@ -1028,16 +1105,16 @@ static void physics_test(float x, float z, float yaw_deg, float secs)
 static void usage(void)
 {
     fprintf(stderr,
-            "usage: mc [--terrain FILE] [--dist N] [--weather NAME] [--auto]\n"
+            "usage: mc [--terrain FILE] [--dist N] [--weather NAME] [--auto] [--cpu]\n"
             "       mc [--terrain FILE] [--dist N] [--weather NAME] [--break N] [--build]\n"
             "          --shot X Y Z YAW PITCH out.ppm\n");
 }
 
 int main(int argc, char **argv)
 {
-    const char *terrain_path = "terrain.bin", *shot_path = NULL;
+    const char *terrain_path = "terrain.bin", *shot_path = NULL, *dump_path = NULL;
     struct camera shot_cam;
-    int dist = RENDER_DIST_DEFAULT, autopilot = 0, breaks = 0, build = 0, i, rc = 0;
+    int dist = RENDER_DIST_DEFAULT, autopilot = 0, breaks = 0, build = 0, cpu_only = 0, i, rc = 0;
     int weather = -1;
 
     for (i = 1; i < argc; i++) {
@@ -1065,6 +1142,10 @@ int main(int argc, char **argv)
             build = 1;
         } else if (strcmp(argv[i], "--auto") == 0) {
             autopilot = 1;
+        } else if (strcmp(argv[i], "--dump") == 0 && i + 1 < argc) {
+            dump_path = argv[++i];
+        } else if (strcmp(argv[i], "--cpu") == 0) {
+            cpu_only = 1;
         } else if (strcmp(argv[i], "--shot") == 0 && i + 6 < argc) {
             shot_cam.pos[0] = strtof(argv[++i], NULL);
             shot_cam.pos[1] = strtof(argv[++i], NULL);
@@ -1084,26 +1165,35 @@ int main(int argc, char **argv)
     render_init(world_render_dist());
     for (i = 0; i < 2; i++) {
         back[i] = aligned_alloc(4096, SCREEN_SIZE);     /* page aligned, for the DMA */
-        if (!back[i])
+        cmdbuf[i] = aligned_alloc(4096, GPU_BUF_SIZE);  /* page aligned, for the GPU */
+        if (!back[i] || !cmdbuf[i])
             return 1;
         memset(back[i], 0, SCREEN_SIZE);
+        memset(cmdbuf[i], 0, GPU_BUF_SIZE);
     }
 
     if (shot_path) {
-        rc = screenshot(&shot_cam, shot_path, breaks, build, weather) ? 1 : 0;
+        rc = screenshot(&shot_cam, shot_path, breaks, build, weather, dump_path) ? 1 : 0;
     } else {
         if (fpga_open() < 0)
             return 1;
         signal(SIGINT, on_signal);
         signal(SIGTERM, on_signal);
-        fpga_setup_dma(back, 2);        /* the FPGA fetches frames itself, if it can */
-        fpga_pick_copy(back[0]);        /* also clears the screen */
+        use_gpu = !cpu_only && fpga_gpu_open(cmdbuf, 2) == 0;
+        if (!use_gpu) {
+            fpga_setup_dma(back, 2);    /* the FPGA fetches frames itself, if it can */
+            fpga_pick_copy(back[0]);    /* also clears the screen */
+        }
         play(autopilot, weather);
+        if (use_gpu)
+            fpga_gpu_close();
         fpga_close();
     }
 
-    for (i = 0; i < 2; i++)
+    for (i = 0; i < 2; i++) {
         free(back[i]);
+        free(cmdbuf[i]);
+    }
     world_free();
     terrain_close();
     return rc;

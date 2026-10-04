@@ -28,3 +28,7 @@ fpga/.qsys_edit/
 /minecraft/terrad
 /minecraft/terrad_host
 /minecraft/bridgebench
+
+# span GPU simulation build and test frames (fpga/sim/run.sh)
+fpga/sim/obj/
+fpga/sim/out/

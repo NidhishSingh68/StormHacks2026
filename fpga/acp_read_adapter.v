@@ -1,8 +1,8 @@
 // acp_read_adapter.v - Avalon-MM burst reads -> cache-coherent AXI3 reads
 //
-// The frame DMA (fb_dma, an mSGDMA) reads the CPU's back buffer from DDR.
-// The CPU draws into normal cached memory, so the newest pixels may still be
-// in its L1/L2 caches. Reads therefore go through the Cortex-A9's ACP
+// The span GPU reads the CPU's command lists from DDR. The CPU writes them
+// into normal cached memory, so the newest commands may still be in its
+// L1/L2 caches. Reads therefore go through the Cortex-A9's ACP
 // (Accelerator Coherency Port), which the FPGA-to-HPS bridge exposes at
 // 0x80000000-0xBFFFFFFF = DDR 0x00000000-0x3FFFFFFF, and are marked
 // cacheable + shared so the ACP snoops the caches:
@@ -11,13 +11,13 @@
 // Platform Designer always sends ARCACHE = 0 for Avalon masters, which the
 // ACP treats as non-coherent, hence this adapter outside the system.
 //
-// The DMA is given plain DDR physical addresses; the window is added here.
+// The GPU uses plain DDR physical addresses; the window is added here.
 // Read-only: the write channels are tied off.
 
 module acp_read_adapter (
     input  wire        clk,
 
-    // Avalon-MM read master side (from fb_dma.mm_read)
+    // Avalon-MM read master side (from span_gpu)
     input  wire [31:0] avm_address,     // DDR physical byte address
     input  wire        avm_read,
     input  wire [2:0]  avm_burstcount,  // 1..4 beats of 8 bytes
@@ -72,7 +72,7 @@ module acp_read_adapter (
     assign arvalid = avm_read;
     assign avm_waitrequest = ~arready;
 
-    // the DMA only asks for data it has room for, so never stall the bridge
+    // the GPU only asks for data it has room for, so never stall the bridge
     assign rready            = 1'b1;
     assign avm_readdata      = rdata;
     assign avm_readdatavalid = rvalid;
