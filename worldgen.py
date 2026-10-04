@@ -79,7 +79,9 @@
      python worldgen.py "Okanagan Lake" --sentinel
 
      # Send straight to the board
-     python worldgen.py "Squamish" --uart /dev/ttyUSB0 --baud 115200
+     python worldgen.py "Squamish" --uart /dev/ttyUSB0          # send to the board
+  python worldgen.py --serve --uart /dev/ttyUSB0              # UI picks -> board
+  python worldgen.py --uart /dev/ttyUSB0 --board-ping
 
      # Bake the demo locations into the cache BEFORE you trust venue wifi
      python worldgen.py --bake-demos
@@ -422,6 +424,12 @@ class World:
     fires: List[Tuple[int, int]] = field(default_factory=list)
     sources: Dict[str, str] = field(default_factory=dict)
     stats: Dict[str, Any] = field(default_factory=dict)
+    # Kept for the voxel-game terrain (terrain.bin), which needs real metres
+    # rather than the 5-bit levels above.
+    elev_m: Optional[np.ndarray] = None       # (128,128) float, smoothed metres
+    bbox: Optional[Tuple[float, float, float, float]] = None   # W, S, E, N
+    exaggeration: float = 1.0
+    terrain_blob: Optional[bytes] = None      # packed terrain.bin, set by write_terrain
 
 
 # ==============================================================================
@@ -1133,6 +1141,118 @@ def classify_blocks(elev_m: np.ndarray,
     return blocks, notes
 
 
+# ==============================================================================
+# SECTION 10b -- POST-PROCESSING  (make obvious places look like themselves)
+#
+# The raw layers are right on average but wrong in ways anyone notices:
+# ESA WorldCover calls both the Sahara and the beach at Copacabana "bare /
+# sparse vegetation", which became grey stone; elevation tiles have holes
+# (zeros) at their seams that punch trenches into the world; and nothing
+# knew where mountains get snow or trees stop growing. These rules fix that
+# before anything is drawn or sent, so the preview and the game agree.
+# ==============================================================================
+
+def fill_dem_voids(elev: np.ndarray, landcover: Optional[np.ndarray]
+                   ) -> Tuple[np.ndarray, int]:
+    """
+    Cells at ~0 m that are not water but sit among higher ground are missing
+    data (tile seams, radar shadows), not sea. Fill them from their
+    neighbours, outside in. Returns (elevation, cells filled).
+    """
+    low = elev <= 0.5
+    if landcover is not None:
+        low &= ~np.isin(landcover, (80, 90))           # real water stays
+    if not low.any():
+        return elev, 0
+    p = np.pad(np.where(low, np.nan, elev), 2, mode="edge")
+    stack = [p[dy:dy + GRID, dx:dx + GRID] for dy in range(5) for dx in range(5)]
+    with np.errstate(all="ignore"):
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            around = np.nanmedian(np.stack(stack), axis=0)
+    void = low & (np.nan_to_num(around, nan=0.0) > 20.0)
+    if not void.any():
+        return elev, 0
+
+    out = elev.astype(np.float64).copy()
+    known = ~void
+    for _ in range(GRID):
+        if known.all():
+            break
+        vals = np.pad(np.where(known, out, 0.0), 1)
+        cnt = np.pad(known.astype(np.float64), 1)
+        s = sum(vals[dy:dy + GRID, dx:dx + GRID] for dy in range(3) for dx in range(3))
+        c = sum(cnt[dy:dy + GRID, dx:dx + GRID] for dy in range(3) for dx in range(3))
+        grow = ~known & (c > 0)
+        out[grow] = s[grow] / c[grow]
+        known |= grow
+    return out.astype(elev.dtype), int(void.sum())
+
+
+def _dilate(mask: np.ndarray, steps: int) -> np.ndarray:
+    m = mask.copy()
+    for _ in range(steps):
+        p = np.pad(m, 1)
+        m = (p[1:-1, 1:-1] | p[:-2, 1:-1] | p[2:, 1:-1] | p[1:-1, :-2] | p[1:-1, 2:] |
+             p[:-2, :-2] | p[:-2, 2:] | p[2:, :-2] | p[2:, 2:])
+    return m
+
+
+def snowline_m(lat: float) -> float:
+    """Rough permanent snowline: ~5200 m at the equator, ~2500 m at 49 degrees."""
+    return max(300.0, 5200.0 - 55.0 * abs(lat))
+
+
+def refine_classes(blocks: np.ndarray, elev: np.ndarray, lat: float,
+                   meters_per_block: float) -> Tuple[np.ndarray, Dict[str, Any]]:
+    """Desert sand, beaches, snowline and treeline. Returns (blocks, notes)."""
+    b = blocks.copy()
+    notes: Dict[str, Any] = {}
+    water = b == BLOCK_WATER
+    land = ~water
+
+    gy, gx = np.gradient(elev.astype(np.float64), meters_per_block)
+    slope = np.degrees(np.arctan(np.hypot(gx, gy)))
+
+    # --- deserts: bare ground with almost no plant life around ---------------
+    veg = np.isin(b, (BLOCK_GRASS, BLOCK_FOREST, BLOCK_DIRT)) & land
+    veg_frac = float(veg.sum()) / max(1, int(land.sum()))
+    if land.any() and veg_frac < 0.2 and abs(lat) < 50:
+        dunes = land & (b == BLOCK_STONE) & (slope < 15) & (elev < 3000)
+        b[dunes] = BLOCK_SAND
+        notes["desert"] = (f"{veg_frac * 100:.0f}% vegetation: bare ground on gentle "
+                           f"slopes -> sand ({dunes.mean() * 100:.0f}% of cells)")
+
+    # --- beaches: low, gentle land right next to the water -------------------
+    if water.any() and land.any():
+        reach = max(1, int(round(60.0 / meters_per_block)))
+        near = _dilate(water, reach) & land
+        # height of the water nearby: spread the water's elevation outwards
+        wlev = np.where(water, elev, -np.inf)
+        for _ in range(reach):
+            p = np.pad(wlev, 1, constant_values=-np.inf)
+            wlev = np.maximum.reduce([p[1:-1, 1:-1], p[:-2, 1:-1], p[2:, 1:-1],
+                                      p[1:-1, :-2], p[1:-1, 2:]])
+        beach = (near & (elev - wlev <= 6.0) & (slope < 12) &
+                 np.isin(b, (BLOCK_STONE, BLOCK_GRASS, BLOCK_DIRT, BLOCK_SAND)))
+        b[beach] = BLOCK_SAND
+        if beach.any():
+            notes["beach"] = f"{int(beach.sum())} shoreline cells -> sand"
+
+    # --- snowline and treeline ------------------------------------------------
+    line = snowline_m(lat)
+    snow = land & (((elev > line) & (slope < 45)) | (elev > line + 400))
+    alpine = land & (b == BLOCK_FOREST) & (elev > line - 600) & ~snow
+    b[alpine & (slope >= 30)] = BLOCK_STONE
+    b[alpine & (slope < 30)] = BLOCK_GRASS
+    b[snow & (b != BLOCK_CITY)] = BLOCK_SNOW
+    if snow.any() or alpine.any():
+        notes["mountains"] = (f"snowline {line:.0f} m: {int(snow.sum())} cells snow, "
+                              f"{int(alpine.sum())} above the treeline")
+    return b, notes
+
+
 def quantize_heights(elev_m: np.ndarray, exaggeration: float, smooth: int
                      ) -> Tuple[np.ndarray, float, float, float]:
     """
@@ -1384,6 +1504,11 @@ def build_world(loc: Location, meters_per_block: float, *,
         sources["sentinel2"] = (f"Sentinel-2 L2A via Earth Search STAC, scene "
                                 f"{indices['scene_id']} on {indices['scene_date']}")
 
+    # ---- Repair elevation holes before anything uses it ----------------------
+    elev, filled = fill_dem_voids(elev, landcover)
+    if filled:
+        log(f"filled {filled} cells of missing elevation data", "ok")
+
     # ---- Heights ------------------------------------------------------------
     log("building the block world", "step")
     heights, m_per_level, elev_lo, elev_hi = quantize_heights(elev, exaggeration, smooth)
@@ -1392,6 +1517,14 @@ def build_world(loc: Location, meters_per_block: float, *,
 
     # ---- Block types --------------------------------------------------------
     blocks, class_notes = classify_blocks(elev, landcover, indices, weather)
+    blocks, refine_notes = refine_classes(blocks, box_blur(elev, smooth), loc.lat,
+                                          meters_per_block)
+    if filled:
+        refine_notes["dem_voids"] = f"{filled} cells of missing elevation filled"
+    if refine_notes:
+        class_notes["postprocess"] = refine_notes
+        for k, v in refine_notes.items():
+            log(f"postprocess {k}: {v}")
     heights, water_level = flatten_water(heights, blocks)
 
     # ---- Flood mode ---------------------------------------------------------
@@ -1431,7 +1564,9 @@ def build_world(loc: Location, meters_per_block: float, *,
                  meters_per_level=m_per_level, elev_min_m=elev_lo,
                  elev_max_m=elev_hi, water_level=water_level,
                  flood_level=flood_level, flood_mask=flood_mask,
-                 fires=fire_cells, sources=sources, stats=stats)
+                 fires=fire_cells, sources=sources, stats=stats,
+                 elev_m=box_blur(elev, smooth), bbox=bbox,
+                 exaggeration=float(exaggeration))
 
 
 # ==============================================================================
@@ -1582,6 +1717,391 @@ def pack_frame(world: World) -> bytes:
     fires = b"".join(struct.pack("<BB", x, y) for x, y in world.fires)
     body = header + payload + fires
     return b"\xA5\x5A" + body + struct.pack("<H", crc16_ccitt(body))
+
+
+# ==============================================================================
+# SECTION 12b -- VOXEL GAME TERRAIN  (terrain.bin for the DE1-SoC game)
+#
+# The game on the board (hackathon/minecraft) does not read the 128x128 byte
+# grid above. It reads terrain.bin: a 4 KB header, then 16x16 tiles of 8-byte
+# column records (ground height, water surface, top block, tree, weather).
+# Its exact layout is the C struct in hackathon/minecraft/terrain.h; this
+# section turns our real elevation + land cover + live weather into it.
+# ==============================================================================
+
+MC_HEIGHT_LIMIT = 128      # world height of the game
+MC_MAX_GROUND = 118        # the game clamps ground and water above this
+MC_BASE = 32               # block height of the lowest ground / sea surface
+MC_MIN_GROUND = 4
+
+# The game's block ids (minecraft/mc.h). Only these make sense as a surface.
+MC_GRASS, MC_DIRT, MC_STONE, MC_SAND, MC_SNOW, MC_COBBLE = 1, 2, 3, 4, 5, 10
+
+# The game's weather ids (minecraft/terrain.h).
+WX_SUNNY, WX_CLOUDY, WX_NIGHT, WX_SNOW, WX_RAIN = 0, 1, 2, 3, 4
+WX_NAMES = ["sunny", "cloudy", "night", "snow", "rain"]
+
+TERRAIN_MAGIC = b"MCTERR1\0"
+TERRAIN_HEADER_SIZE = 4096
+TERRAIN_TILE = 16
+TERRAIN_RECORD = np.dtype([("height", "<u2"), ("water", "<u2"), ("surface", "u1"),
+                           ("feature", "u1"), ("weather", "u1"), ("reserved", "u1")])
+
+# Our land classes -> the block the game puts on top of the column.
+CLASS_TO_SURFACE = {
+    BLOCK_GRASS: MC_GRASS, BLOCK_SAND: MC_SAND, BLOCK_STONE: MC_STONE,
+    BLOCK_SNOW: MC_SNOW, BLOCK_FOREST: MC_GRASS, BLOCK_CITY: MC_COBBLE,
+    BLOCK_DIRT: MC_DIRT, BLOCK_WATER: MC_SAND,     # lake / sea bed
+}
+
+# WMO weather codes (Open-Meteo "weather_code")
+WMO_SNOW = {71, 73, 75, 77, 85, 86}
+WMO_RAIN = {51, 53, 55, 56, 57, 61, 63, 65, 66, 67, 80, 81, 82, 95, 96, 99}
+WMO_OVERCAST = {3, 45, 48}
+
+LAPSE_C_PER_M = 0.0065     # air cools ~6.5 C per km of altitude
+
+
+def classify_weather(w: Weather, temp_c: np.ndarray,
+                     snow_cover: Optional[np.ndarray] = None) -> np.ndarray:
+    """
+    Live conditions -> the game's five weathers, per column.
+
+    temp_c is the air temperature at each column (the reported temperature
+    corrected for altitude), so rain at the town can be snow on the peaks.
+      - snow falling, or rain/drizzle where it is at or below freezing -> SNOW
+      - rain, drizzle, showers, thunderstorms                         -> RAIN
+      - 70%+ cloud, overcast or fog                                   -> CLOUDY
+      - otherwise                                                     -> SUNNY
+    After dark, clear and cloudy skies become NIGHT; falling rain or snow
+    stays rain or snow (that is what you would notice). Snow-covered ground
+    under a mostly cloudy sky also gets SNOW, so glaciers look the part.
+    """
+    code = int(w.weather_code)
+    snowing = w.snowfall_cm_h > 0.05 or code in WMO_SNOW
+    raining = w.rain_mm_h > 0.1 or code in WMO_RAIN
+    cloudy = w.cloud_cover_pct >= 70 or code in WMO_OVERCAST
+
+    out = np.full(temp_c.shape, WX_CLOUDY if cloudy else WX_SUNNY, dtype=np.uint8)
+    if raining:
+        out[:] = WX_RAIN
+    if snowing:
+        out[:] = WX_SNOW
+    elif raining:
+        out[temp_c <= 0.5] = WX_SNOW
+    if snow_cover is not None and w.cloud_cover_pct >= 50:
+        out[snow_cover] = WX_SNOW
+    if not w.is_day:
+        out[(out == WX_SUNNY) | (out == WX_CLOUDY)] = WX_NIGHT
+    return out
+
+
+def _label_regions(mask: np.ndarray) -> Tuple[np.ndarray, int]:
+    """4-connected components of a boolean grid (no scipy). Labels 1..n."""
+    from collections import deque
+    h, w = mask.shape
+    labels = np.zeros((h, w), dtype=np.int32)
+    n = 0
+    for y0, x0 in zip(*np.nonzero(mask)):
+        if labels[y0, x0]:
+            continue
+        n += 1
+        labels[y0, x0] = n
+        q = deque([(y0, x0)])
+        while q:
+            y, x = q.popleft()
+            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= ny < h and 0 <= nx < w and mask[ny, nx] and not labels[ny, nx]:
+                    labels[ny, nx] = n
+                    q.append((ny, nx))
+    return labels, n
+
+
+def _grow(a: np.ndarray, fn) -> np.ndarray:
+    """Combine each cell with its 8 neighbours using fn (np.maximum / np.minimum)."""
+    p = np.pad(a, 1, mode="edge")
+    out = a.copy()
+    for dy in (0, 1, 2):
+        for dx in (0, 1, 2):
+            out = fn(out, p[dy:dy + a.shape[0], dx:dx + a.shape[1]])
+    return out
+
+
+def build_terrain_columns(world: World, blocks_per_cell: int = 2) -> Dict[str, Any]:
+    """
+    Turn the world into the game's column grid, N x N with N = 128 *
+    blocks_per_cell (each of our cells becomes blocks_per_cell^2 columns,
+    elevation interpolated smoothly between them).
+
+    Heights are true to scale where they fit: one block of height is as many
+    metres as one block of width (times the exaggeration). Only terrain too
+    tall for the 128-block world is squeezed. Every lake and the sea gets one
+    flat surface (the median elevation of its cells) and a bed that deepens
+    away from the shore. Forest becomes trees, built-up areas cobblestone.
+    The spawn point is moved to column (0, 0), where the game starts you.
+    """
+    if world.elev_m is None:
+        raise ValueError("world has no elevation in metres (built by an old version?)")
+    up = max(1, int(blocks_per_cell))
+    n = GRID * up
+    elev = world.elev_m.astype(np.float64)
+    blocks = world.blocks
+    water = blocks == BLOCK_WATER
+
+    # ---- one flat surface per body of water (on the 128 grid) --------------
+    labels, nregions = _label_regions(water)
+    surf_m = np.zeros_like(elev)
+    flood_m = None
+    if world.flood_level > 0:
+        flood_m = world.elev_min_m + world.flood_level * world.meters_per_level
+    for r in range(1, nregions + 1):
+        cells = labels == r
+        level = float(np.median(elev[cells]))
+        if flood_m is not None:
+            level = max(level, flood_m)
+        surf_m[cells] = level
+
+    # ---- upsample: smooth elevation, blocky classes -------------------------
+    elev_u = resample_2d(elev, n, n, "bilinear").astype(np.float64)
+    cls_u = np.repeat(np.repeat(blocks, up, axis=0), up, axis=1)
+    surf_u = np.repeat(np.repeat(surf_m, up, axis=0), up, axis=1)
+    water_u = cls_u == BLOCK_WATER
+
+    # ---- metres -> blocks ---------------------------------------------------
+    m_per_block = world.meters_per_block / up
+    land = ~water_u
+    lows = [float(np.percentile(elev_u[land], 1))] if land.any() else []
+    highs = [float(np.percentile(elev_u[land], 99.5))] if land.any() else []
+    if water_u.any():
+        lows.append(float(surf_u[water_u].min()))
+        highs.append(float(surf_u[water_u].max()))
+    e_lo, e_hi = min(lows), max(highs)
+    m_per_level = m_per_block / max(0.05, world.exaggeration)
+    room = MC_MAX_GROUND - MC_BASE - 4
+    if (e_hi - e_lo) / m_per_level > room:
+        m_per_level = (e_hi - e_lo) / room           # too tall: squeeze to fit
+
+    def to_blocks(m):
+        return np.round(MC_BASE + (m - e_lo) / m_per_level)
+
+    height = np.clip(to_blocks(elev_u), MC_MIN_GROUND, MC_MAX_GROUND).astype(np.int32)
+    water_top = np.where(water_u, np.clip(to_blocks(surf_u), MC_MIN_GROUND + 1,
+                                          MC_MAX_GROUND), 0).astype(np.int32)
+
+    # Water beds deepen with distance from the shore (1 block at the edge).
+    dist = np.zeros((n, n), dtype=np.int32)
+    inner = water_u.copy()
+    for d in range(1, 9):
+        inner = inner & (_grow(inner.astype(np.int8), np.minimum) > 0)
+        dist[inner] = d
+    depth = np.clip(1 + dist // max(1, up), 1, 6)
+    height = np.where(water_u, np.minimum(height, water_top - depth), height)
+    height = np.maximum(height, MC_MIN_GROUND)
+
+    # Dry land never sits below the water right next to it.
+    near_water = _grow(water_top, np.maximum)
+    height = np.where(land, np.maximum(height, near_water), height)
+
+    # ---- what is on top -----------------------------------------------------
+    surface = np.full((n, n), MC_GRASS, dtype=np.uint8)
+    for cls, blk in CLASS_TO_SURFACE.items():
+        surface[cls_u == cls] = blk
+    surface[water_u & (depth > 2)] = MC_DIRT                     # deep beds
+    slope = np.maximum(_grow(height, np.maximum) - height, height - _grow(height, np.minimum))
+    greenish = land & ((cls_u == BLOCK_GRASS) | (cls_u == BLOCK_FOREST))
+    surface[greenish & (slope >= 3)] = MC_STONE                  # cliffs
+    # the waterline itself: a sandy strip two columns wide wherever it is low
+    shore = land & (_grow(water_u.astype(np.int8), np.maximum) > 0)
+    shore2 = land & (_grow(_grow(water_u.astype(np.int8), np.maximum), np.maximum) > 0)
+    soft = np.isin(cls_u, (BLOCK_GRASS, BLOCK_STONE, BLOCK_DIRT, BLOCK_SAND))
+    surface[shore2 & soft & (slope < 3) & (height <= near_water + 1)] = MC_SAND
+
+    # farmland: patchwork fields (8x8 columns), mostly green, some ploughed
+    fy, fx = np.mgrid[0:n, 0:n] // 8
+    field = (fx * 0x9E3779B1 + fy * 0x85EBCA77 + 12345) & 0xFFFFFFFF
+    field = ((field ^ (field >> 15)) * 0x2C1B3C6D & 0xFFFFFFFF) >> 28
+    farm = land & (cls_u == BLOCK_DIRT)
+    surface[farm] = np.where(field[farm] < 6, MC_DIRT, MC_GRASS)
+
+    # ---- trees: one candidate per 4x4 block cell, kept by land class -------
+    rng = np.random.default_rng(int(abs(world.location.lat * 1e4) + abs(world.location.lon * 1e4)))
+    feature = np.zeros((n, n), dtype=np.uint8)
+    cell = 4
+    for cy in range(0, n, cell):
+        for cx in range(0, n, cell):
+            y, x = cy + int(rng.integers(cell)), cx + int(rng.integers(cell))
+            if y >= n or x >= n or not land[y, x] or surface[y, x] != MC_GRASS:
+                continue
+            p = 0.4 if cls_u[y, x] == BLOCK_FOREST else 0.03
+            if slope[y, x] <= 2 and not shore[y, x] and rng.random() < p:
+                feature[y, x] = 1
+
+    # ---- weather, per column -----------------------------------------------
+    centre_m = float(elev_u[n // 2, n // 2])
+    temp = world.weather.temperature_c - LAPSE_C_PER_M * (elev_u - centre_m)
+    weather = classify_weather(world.weather, temp, cls_u == BLOCK_SNOW)
+
+    # ---- put the spawn at (0, 0) -------------------------------------------
+    sx, sy = world.spawn[0] * up + up // 2, world.spawn[1] * up + up // 2
+    arrays = dict(height=height, water=water_top, surface=surface,
+                  feature=feature, weather=weather)
+    for k in arrays:
+        arrays[k] = np.roll(arrays[k], (-sy, -sx), axis=(0, 1))
+    for dy in range(-3, 4):                      # keep the spawn clear of trees
+        for dx in range(-3, 4):
+            arrays["feature"][dy % n, dx % n] = 0
+
+    w_, s_, e_, n_ = world.bbox
+    origin_lon = w_ + (sx + 0.5) / n * (e_ - w_)
+    origin_lat = n_ - (sy + 0.5) / n * (n_ - s_)
+    sea = int(water_top[water_u].min()) if water_u.any() else MC_BASE
+
+    return dict(size=n, sea_level=sea, origin_lat=origin_lat, origin_lon=origin_lon,
+                meters_per_block=m_per_block, meters_per_level=m_per_level,
+                source=f"worldgen: {world.location.label}", **arrays)
+
+
+def pack_terrain_header(cols: Dict[str, Any]) -> bytes:
+    """The 128 meaningful bytes of terrain.bin's header (rest is zero)."""
+    n = cols["size"]
+    return struct.pack("<8s8I3d64s", TERRAIN_MAGIC, 1, TERRAIN_HEADER_SIZE, n, n,
+                       TERRAIN_TILE, TERRAIN_RECORD.itemsize, MC_HEIGHT_LIMIT,
+                       int(cols["sea_level"]), float(cols["origin_lat"]),
+                       float(cols["origin_lon"]), float(cols["meters_per_block"]),
+                       cols["source"].encode("utf-8", "replace")[:63])
+
+
+def terrain_records(cols: Dict[str, Any]) -> np.ndarray:
+    """(N, N) array of column records, row 0 = north, column 0 = west."""
+    n = cols["size"]
+    rec = np.zeros((n, n), dtype=TERRAIN_RECORD)
+    for k in ("height", "water", "surface", "feature", "weather"):
+        rec[k] = cols[k]
+    return rec
+
+
+def pack_terrain_bin(cols: Dict[str, Any]) -> bytes:
+    """The complete terrain.bin: header, then 16x16 tiles of records."""
+    n = cols["size"]
+    t = TERRAIN_TILE
+    tiles = terrain_records(cols).reshape(n // t, t, n // t, t).transpose(0, 2, 1, 3)
+    return pack_terrain_header(cols).ljust(TERRAIN_HEADER_SIZE, b"\0") + \
+        np.ascontiguousarray(tiles).tobytes()
+
+
+# ---- compact transfer encoding ("TRZ1") --------------------------------------
+#
+# terrain.bin is mostly smooth or constant, so for the UART it is sent as 8
+# byte-planes (byte k of every record, in north-to-south, west-to-east order),
+# each delta coded (byte minus the previous byte, mod 256) and then run-length
+# coded with PackBits. A 256x256 world is 512 KB raw and usually a few tens of
+# KB like this. The board rebuilds terrain.bin and checks its CRC-32.
+#
+#   "TRZ1" | u32 width | u32 depth | 128-byte terrain header
+#   8 x ( u32 length | PackBits bytes )
+#   u32 CRC-32 (zlib) of the complete terrain.bin
+
+def packbits(data: np.ndarray) -> bytes:
+    """
+    PackBits: control byte c, then
+      c in 0..127    -> c + 1 literal bytes follow
+      c in 129..255  -> the next byte repeats 257 - c times (2..128)
+    """
+    a = np.asarray(data, dtype=np.uint8)
+    out = bytearray()
+    lit = bytearray()
+
+    def flush():
+        for i in range(0, len(lit), 128):
+            chunk = lit[i:i + 128]
+            out.append(len(chunk) - 1)
+            out.extend(chunk)
+        lit.clear()
+
+    if a.size == 0:
+        return b""
+    edges = np.flatnonzero(np.diff(a)) + 1
+    starts = np.concatenate(([0], edges))
+    ends = np.concatenate((edges, [a.size]))
+    for s, e in zip(starts.tolist(), ends.tolist()):
+        run, v = e - s, int(a[s])
+        if run < 3:
+            lit.extend(bytes((v,)) * run)
+            continue
+        flush()
+        while run >= 2:
+            k = min(run, 128)
+            out.append(257 - k)
+            out.append(v)
+            run -= k
+        if run:
+            lit.append(v)
+    flush()
+    return bytes(out)
+
+
+def unpackbits(data: bytes, size: int) -> np.ndarray:
+    """Inverse of packbits (used by the self test; the board has a C copy)."""
+    out = bytearray()
+    i = 0
+    while i < len(data) and len(out) < size:
+        c = data[i]
+        i += 1
+        if c < 128:
+            out.extend(data[i:i + c + 1])
+            i += c + 1
+        elif c > 128:
+            out.extend(bytes((data[i],)) * (257 - c))
+            i += 1
+    return np.frombuffer(bytes(out[:size]), dtype=np.uint8)
+
+
+def pack_terrain_transfer(cols: Dict[str, Any], terrain_bin: bytes) -> bytes:
+    import zlib
+    n = cols["size"]
+    planes = terrain_records(cols).view(np.uint8).reshape(n * n, TERRAIN_RECORD.itemsize)
+    parts = [b"TRZ1", struct.pack("<II", n, n), pack_terrain_header(cols)]
+    for k in range(TERRAIN_RECORD.itemsize):
+        p = planes[:, k]
+        delta = np.diff(p, prepend=np.uint8(0)).astype(np.uint8)   # mod 256
+        enc = packbits(delta)
+        parts += [struct.pack("<I", len(enc)), enc]
+    parts.append(struct.pack("<I", zlib.crc32(terrain_bin) & 0xFFFFFFFF))
+    return b"".join(parts)
+
+
+def unpack_terrain_transfer(blob: bytes) -> bytes:
+    """Rebuild terrain.bin from a TRZ1 blob, as the board does (for the self test)."""
+    import zlib
+    assert blob[:4] == b"TRZ1"
+    w, d = struct.unpack_from("<II", blob, 4)
+    hdr = blob[12:140]
+    off = 140
+    planes = np.zeros((w * d, TERRAIN_RECORD.itemsize), dtype=np.uint8)
+    for k in range(TERRAIN_RECORD.itemsize):
+        (ln,) = struct.unpack_from("<I", blob, off)
+        off += 4
+        delta = unpackbits(blob[off:off + ln], w * d)
+        off += ln
+        planes[:, k] = np.cumsum(delta, dtype=np.uint64).astype(np.uint8)
+    (crc,) = struct.unpack_from("<I", blob, off)
+    t = TERRAIN_TILE
+    rec = planes.reshape(d, w, TERRAIN_RECORD.itemsize)
+    tiles = rec.reshape(d // t, t, w // t, t, -1).transpose(0, 2, 1, 3, 4)
+    out = hdr.ljust(TERRAIN_HEADER_SIZE, b"\0") + np.ascontiguousarray(tiles).tobytes()
+    if zlib.crc32(out) & 0xFFFFFFFF != crc:
+        raise ValueError("TRZ1 CRC mismatch")
+    return out
+
+
+def describe_terrain(cols: Dict[str, Any]) -> str:
+    wx = np.bincount(cols["weather"].ravel(), minlength=5)
+    tot = cols["size"] ** 2
+    wtxt = ", ".join(f"{WX_NAMES[i]} {100 * c / tot:.0f}%" for i, c in enumerate(wx) if c)
+    return (f"{cols['size']}x{cols['size']} columns, ground {int(cols['height'].min())}-"
+            f"{int(cols['height'].max())}, sea {cols['sea_level']}, "
+            f"{int(cols['feature'].sum())} trees, {cols['meters_per_block']:.0f} m/block, "
+            f"{cols['meters_per_level']:.1f} m per level; weather {wtxt}")
 
 
 # ==============================================================================
@@ -1835,29 +2355,163 @@ def write_png(world: World, path: str, scale: int = 5) -> bool:
 # SECTION 15 -- SENDING TO THE BOARD OVER UART
 # ==============================================================================
 
-def send_uart(world: World, port: str, baud: int = 115200) -> bool:
-    """Write the framed world to a serial port. Needs `pip install pyserial`."""
+# The board runs `terrad` (hackathon/minecraft/terrad.c), which owns the
+# board's console UART, runs the game, and swaps in each new world:
+#
+#   PC -> board   "TRRA" | u8 type | u8 seq | u16 0 | u32 length
+#                 | u32 CRC-32(payload) | u32 CRC-32(previous 16 bytes) | payload
+#                 type 1 = WORLD (payload: TRZ1 blob), 2 = PING, 3 = CONSOLE
+#   board -> PC   text lines "@TERRAD READY | RECV s n | OK s | ERR s why | PONG s"
+#
+# Kernel messages share the same UART, so replies are found by their prefix.
+
+FRAME_WORLD, FRAME_PING, FRAME_CONSOLE = 1, 2, 3
+_board_seq = 0
+
+
+def pack_board_frame(ftype: int, seq: int, payload: bytes = b"") -> bytes:
+    import zlib
+    head = struct.pack("<4sBBHII", b"TRRA", ftype, seq & 0xFF, 0, len(payload),
+                       zlib.crc32(payload) & 0xFFFFFFFF)
+    return head + struct.pack("<I", zlib.crc32(head) & 0xFFFFFFFF) + payload
+
+
+def board_send(port: str, baud: int, ftype: int, payload: bytes = b"",
+               expect: Optional[str] = "OK", progress=None) -> Tuple[bool, str]:
+    """
+    Send one frame to terrad and wait for its answer. Returns (ok, reply).
+    expect is the reply word that means success (OK / PONG / CONSOLE), or
+    None to not wait at all.
+    """
+    global _board_seq
     try:
         import serial
     except ImportError:
-        log("pyserial not installed: pip install pyserial", "err")
-        return False
+        return False, "pyserial not installed: pip install pyserial"
 
-    frame = pack_frame(world)
-    log(f"sending {len(frame)} bytes to {port} at {baud} baud", "step")
+    _board_seq = (_board_seq + 1) & 0xFF
+    seq = _board_seq
+    frame = pack_board_frame(ftype, seq, payload)
+    # the line takes ~10 bits per byte; allow for decoding and writing on the board
+    deadline_s = len(frame) * 10.0 / baud * 1.5 + 15.0
     try:
-        with serial.Serial(port, baud, timeout=5) as ser:
+        with serial.Serial(port, baud, timeout=0.2, write_timeout=deadline_s) as ser:
+            ser.reset_input_buffer()
             t0 = time.time()
-            # Send in chunks so a slow receiver does not overflow its FIFO.
-            for i in range(0, len(frame), 256):
-                ser.write(frame[i:i + 256])
-                ser.flush()
-            dt = time.time() - t0
-        log(f"sent in {dt:.2f} s", "ok")
-        return True
+            for i in range(0, len(frame), 1024):
+                ser.write(frame[i:i + 1024])
+                if progress:
+                    progress(min(len(frame), i + 1024), len(frame))
+            ser.flush()
+            if expect is None:
+                return True, "sent"
+            buf = b""
+            while time.time() - t0 < deadline_s:
+                buf += ser.read(256)
+                for raw in buf.split(b"\n"):
+                    line = raw.decode("ascii", "replace").strip()
+                    if not line.startswith("@TERRAD "):
+                        continue
+                    words = line.split()
+                    if len(words) >= 3 and words[1] in (expect, "ERR") and words[2] == str(seq):
+                        return words[1] == expect, line[len("@TERRAD "):]
+                    if expect == "CONSOLE" and words[1:2] == ["CONSOLE"]:
+                        return True, "CONSOLE"
+            return False, "no answer from the board (is terrad running?)"
     except Exception as exc:
-        log(f"UART send failed: {short(exc)}", "err")
-        return False
+        return False, f"serial error: {short(exc)}"
+
+
+def send_uart(world: World, port: str, baud: int = 115200,
+              blocks_per_cell: int = 2) -> bool:
+    """Send the world to the game on the board (via terrad). Needs pyserial."""
+    cols = build_terrain_columns(world, blocks_per_cell)
+    tb = pack_terrain_bin(cols)
+    blob = pack_terrain_transfer(cols, tb)
+    return send_terrain_blob(blob, port, baud, world.location.label)
+
+
+def send_terrain_blob(blob: bytes, port: str, baud: int, label: str = "",
+                      progress=None) -> bool:
+    log(f"sending {label or 'world'} to the board: {len(blob)} bytes on {port} at "
+        f"{baud} baud (~{len(blob) * 10 / baud:.0f} s)", "step")
+    t0 = time.time()
+    for attempt in (1, 2):
+        ok, msg = board_send(port, baud, FRAME_WORLD, blob, progress=progress)
+        if ok:
+            log(f"board has the new world ({time.time() - t0:.1f} s), game restarting", "ok")
+            return True
+        log(f"board transfer failed: {msg}" + ("; retrying" if attempt == 1 else ""), "warn")
+    return False
+
+
+class BoardPusher:
+    """
+    Background sender for --serve: each new destination is queued, and only
+    the newest one waiting is sent once the current transfer finishes (picking
+    five places quickly sends the first and the last, not all five).
+    """
+
+    def __init__(self, port: str, baud: int):
+        import itertools
+        import threading
+        self.port, self.baud = port, baud
+        self.cond = threading.Condition()
+        self.pending: Optional[Tuple[bytes, str, Any]] = None
+        self.ticket = itertools.count(1)     # order in which requests arrived
+        self.newest = 0                      # newest request already queued/sent
+        self.state = {"state": "idle", "place": "", "detail": "", "upload_id": None,
+                      "progress": 0, "time": time.time()}
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def take_ticket(self) -> int:
+        """Call when a request arrives; pass the number to push()."""
+        with self.cond:
+            return next(self.ticket)
+
+    def push(self, blob: bytes, label: str, ticket: int, upload_id: Any = None) -> None:
+        """Queue a world, unless a request that arrived later got there first
+        (picks are slow to build, so they can finish out of order)."""
+        with self.cond:
+            if ticket < self.newest:
+                log(f"not sending {label}: a newer destination was picked", "info")
+                return
+            self.newest = ticket
+            self.pending = (blob, label, upload_id)
+            self.state.update(state="queued", place=label, upload_id=upload_id,
+                              progress=0, detail="", time=time.time())
+            self.cond.notify()
+
+    def status(self) -> Dict[str, Any]:
+        with self.cond:
+            return dict(self.state, queued=self.pending is not None)
+
+    def _set(self, **kw) -> None:
+        with self.cond:
+            self.state.update(kw, time=time.time())
+
+    def _run(self) -> None:
+        while True:
+            with self.cond:
+                while self.pending is None:
+                    self.cond.wait()
+                blob, label, uid = self.pending
+                self.pending = None
+            self._set(state="sending", place=label, upload_id=uid, progress=0,
+                      detail=f"{len(blob)} bytes")
+
+            def progress(done, total):
+                self._set(progress=int(100 * done / max(1, total)))
+
+            ok = send_terrain_blob(blob, self.port, self.baud, label, progress)
+            with self.cond:
+                superseded = self.pending is not None
+            self._set(state="done" if ok else "failed", place=label, upload_id=uid,
+                      progress=100 if ok else self.state["progress"],
+                      detail="game restarted on the new world" if ok else
+                      "no answer from the board (is it on, and terrad installed?)")
+            if superseded:
+                log("another upload is waiting; sending it next", "info")
 
 
 # ==============================================================================
@@ -1947,10 +2601,31 @@ def speak_with_elevenlabs(text: str, api_key: str, path: str,
 # SECTION 17 -- OUTPUT ORCHESTRATION
 # ==============================================================================
 
+def write_terrain(world: World, out_dir: str, blocks_per_cell: int = 2) -> Dict[str, str]:
+    """terrain.bin for the voxel game, and terrain.trz (the same, packed for UART)."""
+    cols = build_terrain_columns(world, blocks_per_cell)
+    tb = pack_terrain_bin(cols)
+    blob = pack_terrain_transfer(cols, tb)
+    paths = {"terrain_bin": os.path.join(out_dir, "terrain.bin"),
+             "terrain_trz": os.path.join(out_dir, "terrain.trz")}
+    with open(paths["terrain_bin"], "wb") as f:
+        f.write(tb)
+    with open(paths["terrain_trz"], "wb") as f:
+        f.write(blob)
+    world.terrain_blob = blob       # in memory: the server must not re-read a shared file
+    log(f"wrote {paths['terrain_bin']} ({describe_terrain(cols)})", "ok")
+    log(f"wrote {paths['terrain_trz']} ({len(blob)} bytes for the UART)", "ok")
+    world.stats["terrain"] = {"columns": cols["size"], "trees": int(cols["feature"].sum()),
+                              "transfer_bytes": len(blob),
+                              "weather": WX_NAMES[int(np.bincount(cols["weather"].ravel()).argmax())]}
+    return paths
+
+
 def emit_all(world: World, out_dir: str, *, png_scale: int = 5,
              gemini_key: str = "", eleven_key: str = "",
              gemini_model: str = "gemini-2.5-flash",
-             voice_id: str = "21m00Tcm4TlvDq8ikWAM") -> Dict[str, str]:
+             voice_id: str = "21m00Tcm4TlvDq8ikWAM",
+             blocks_per_cell: int = 2) -> Dict[str, str]:
     """Write every output file. Returns a map of name -> path."""
     os.makedirs(out_dir, exist_ok=True)
     paths: Dict[str, str] = {}
@@ -1960,6 +2635,7 @@ def emit_all(world: World, out_dir: str, *, png_scale: int = 5,
     p = os.path.join(out_dir, "world.frame");  write_frame(world, p); paths["frame"] = p
     p = os.path.join(out_dir, "world.mif");    write_mif(world, p);   paths["mif"] = p
     p = os.path.join(out_dir, "world.hex");    write_hex(world, p);   paths["hex"] = p
+    paths.update(write_terrain(world, out_dir, blocks_per_cell))
     p = os.path.join(out_dir, "world.json");   write_json(world, p);  paths["json"] = p
 
     p = os.path.join(out_dir, "preview.txt")
@@ -2013,6 +2689,18 @@ def serve(host: str, port: int, out_dir: str, cache_dir: str, defaults) -> None:
     """
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+    import itertools
+    import threading
+    pusher = BoardPusher(defaults.uart, defaults.baud) if defaults.uart else None
+    if pusher:
+        log(f"Upload sends worlds to the board on {defaults.uart}", "ok")
+    # Worlds built by /generate, kept in memory until someone uploads them
+    # (every request writes the same out/ files, so those can't be trusted).
+    built: Dict[str, Tuple[bytes, str]] = {}
+    built_order: List[str] = []
+    built_lock = threading.Lock()
+    build_ids = itertools.count(1)
+
     class Handler(BaseHTTPRequestHandler):
         def _send(self, code, body: bytes, ctype="application/json"):
             self.send_response(code)
@@ -2047,11 +2735,33 @@ def serve(host: str, port: int, out_dir: str, cache_dir: str, defaults) -> None:
                         "/generate": "?place=<name>&scale=<m/block>&exaggeration=<f>"
                                      "&flood_meters=<m>&sentinel=0|1&fires=0|1",
                         "/demos": "list of pre-cached demo locations",
+                        "/upload": "?id=<upload_id from /generate>: send that world to the board",
+                        "/board": "state of the transfer to the board (--uart)",
                         "/files/<name>": "download generated files",
                     },
                     "block_types": {str(k): v for k, v in BLOCK_NAMES.items()},
                 }
                 return self._send(200, json.dumps(help_text, indent=2).encode())
+
+            if route == "/board":
+                body = pusher.status() if pusher else {"state": "disabled",
+                                                       "detail": "start with --uart PORT"}
+                return self._send(200, json.dumps(body).encode())
+
+            if route == "/upload":
+                if not pusher:
+                    return self._send(503, json.dumps({
+                        "error": "no board connected: start the server with --uart PORT "
+                                 "(./run.sh does that)"}).encode())
+                uid = arg("id", "")
+                with built_lock:
+                    entry = built.get(uid)
+                if entry is None:
+                    return self._send(404, json.dumps({
+                        "error": "that world is gone; press Generate again"}).encode())
+                pusher.push(entry[0], entry[1], pusher.take_ticket(), uid)
+                return self._send(200, json.dumps({"state": "queued", "upload_id": uid,
+                                                   "place": entry[1]}).encode())
 
             if route == "/demos":
                 demos = [{"key": k, "place": p, "scale": s, "note": note}
@@ -2104,13 +2814,26 @@ def serve(host: str, port: int, out_dir: str, cache_dir: str, defaults) -> None:
                                      gemini_key=defaults.gemini_key,
                                      eleven_key=defaults.eleven_key,
                                      gemini_model=defaults.gemini_model,
-                                     voice_id=defaults.voice)
+                                     voice_id=defaults.voice,
+                                     blocks_per_cell=defaults.blocks_per_cell)
+
+                    # Keep the world for a later /upload (the newest 16).
+                    upload_id = None
+                    if world.terrain_blob:
+                        upload_id = str(next(build_ids))
+                        with built_lock:
+                            built[upload_id] = (world.terrain_blob, world.location.label)
+                            built_order.append(upload_id)
+                            while len(built_order) > 16:
+                                built.pop(built_order.pop(0), None)
 
                     body = world_to_dict(world)
                     body["files"] = {k: f"/files/{os.path.basename(v)}"
                                      for k, v in paths.items()}
                     # Handy for the website: the whole world as base64, no second fetch.
                     body["world_base64"] = base64.b64encode(pack_payload(world)).decode()
+                    body["upload_id"] = upload_id
+                    body["board"] = bool(pusher)
                     if "narration_txt" in paths:
                         with open(paths["narration_txt"]) as f:
                             body["narration"] = f.read().strip()
@@ -2206,6 +2929,8 @@ def self_test() -> int:
     world = World(location=loc, weather=weather, heights=heights, blocks=blocks,
                   spawn=spawn, meters_per_block=30.0, meters_per_level=mpl,
                   elev_min_m=lo, elev_max_m=hi, water_level=water_level,
+                  elev_m=box_blur(elev, 1), bbox=bbox_from_center(loc.lat, loc.lon, 30.0),
+                  exaggeration=1.5,
                   stats={"span_km": 3.84,
                          "block_percent": {BLOCK_NAMES[b]:
                                            round(100.0 * (blocks == b).mean(), 1)
@@ -2337,6 +3062,42 @@ def self_test() -> int:
         check("json round trips", meta["grid"]["size"] == 128 and
               meta["spawn"]["x"] == sx)
 
+    # --- voxel-game terrain (terrain.bin + UART blob) -----------------------
+    import zlib
+    cols = build_terrain_columns(world, 2)
+    tb = pack_terrain_bin(cols)
+    n = cols["size"]
+    check("terrain.bin has the right size", len(tb) == 4096 + n * n * 8, f"{len(tb)} bytes")
+    check("terrain header magic and size",
+          tb[:8] == TERRAIN_MAGIC and struct.unpack_from("<II", tb, 16) == (n, n))
+    rec = np.frombuffer(tb, dtype=TERRAIN_RECORD, offset=4096)
+    # column (x=17, z=5) lives in tile 1 of tile row 0, row 5, column 1
+    k = (0 * (n // 16) + 1) * 256 + 5 * 16 + 1
+    check("tile layout puts (17, 5) where the game reads it",
+          int(rec["height"][k]) == int(cols["height"][5, 17]))
+    check("heights within the game's limits",
+          int(cols["height"].min()) >= MC_MIN_GROUND and int(cols["height"].max()) <= MC_MAX_GROUND)
+    land = cols["water"] <= cols["height"]
+    check("spawn column (0, 0) is dry land", bool(land[0, 0]))
+    check("snowing weather -> snow everywhere it is falling",
+          bool((cols["weather"] == WX_SNOW).all()))
+    blob = pack_terrain_transfer(cols, tb)
+    check("TRZ1 blob unpacks to the identical terrain.bin",
+          unpack_terrain_transfer(blob) == tb, f"{len(blob)} of {len(tb)} bytes")
+    frame = pack_board_frame(FRAME_WORLD, 7, blob)
+    check("board frame header CRC and payload CRC",
+          zlib.crc32(frame[:16]) & 0xFFFFFFFF == struct.unpack_from("<I", frame, 16)[0] and
+          zlib.crc32(frame[20:]) & 0xFFFFFFFF == struct.unpack_from("<I", frame, 12)[0])
+    for wx, expect in ((Weather(is_day=1, cloud_cover_pct=10), WX_SUNNY),
+                       (Weather(is_day=1, cloud_cover_pct=90), WX_CLOUDY),
+                       (Weather(is_day=0, cloud_cover_pct=10), WX_NIGHT),
+                       (Weather(is_day=1, rain_mm_h=2.0), WX_RAIN),
+                       (Weather(is_day=0, rain_mm_h=2.0), WX_RAIN)):
+        got = int(classify_weather(wx, np.array([10.0]))[0])
+        check(f"weather -> {WX_NAMES[expect]}", got == expect, WX_NAMES[got])
+    cold = classify_weather(Weather(is_day=1, rain_mm_h=2.0), np.array([8.0, -3.0]))
+    check("rain falls as snow on cold high ground", list(cold) == [WX_RAIN, WX_SNOW])
+
     print("=" * 70)
     if failures:
         print(f"  {len(failures)} CHECK(S) FAILED: {', '.join(failures)}")
@@ -2363,7 +3124,9 @@ examples:
   python worldgen.py --lat 49.28 --lon -123.12 --scale 60
   python worldgen.py "Richmond BC" --flood-meters 6
   python worldgen.py "Kelowna" --fires --firms-key KEY --sentinel
-  python worldgen.py "Squamish" --uart /dev/ttyUSB0 --baud 115200
+  python worldgen.py "Squamish" --uart /dev/ttyUSB0          # send to the board
+  python worldgen.py --serve --uart /dev/ttyUSB0              # UI picks -> board
+  python worldgen.py --uart /dev/ttyUSB0 --board-ping
   python worldgen.py --bake-demos
   python worldgen.py --serve --port 8080
 """)
@@ -2405,10 +3168,18 @@ examples:
                    help="1 = full 128 wide preview, 2 = 64 wide (default 2)")
     g.add_argument("--quiet", action="store_true", help="less chatter")
 
-    g = p.add_argument_group("hardware")
+    g = p.add_argument_group("hardware (the DE1-SoC voxel game, via terrad)")
     g.add_argument("--uart", metavar="PORT",
-                   help="serial port to send the world to, e.g. /dev/ttyUSB0 or COM3")
+                   help="board's serial port, e.g. /dev/ttyUSB0 or COM3: send the "
+                        "world to the game (with --serve: every generated world)")
     g.add_argument("--baud", type=int, default=115200, help="baud rate (default 115200)")
+    g.add_argument("--blocks-per-cell", type=int, default=2,
+                   help="game columns per 128-grid cell along each side: 1 = 128x128, "
+                        "2 = 256x256 (default), 4 = 512x512 (slower to send)")
+    g.add_argument("--board-ping", action="store_true",
+                   help="check that terrad answers on --uart, then exit")
+    g.add_argument("--board-console", action="store_true",
+                   help="tell terrad to give the UART back to a login shell, then exit")
 
     g = p.add_argument_group("ai extras (optional tracks)")
     g.add_argument("--gemini-key", default=os.environ.get("GEMINI_API_KEY", ""),
@@ -2439,6 +3210,17 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if args.self_test:
         return self_test()
+
+    if args.board_ping or args.board_console:
+        if not args.uart:
+            log("--board-ping / --board-console need --uart PORT", "err")
+            return 2
+        if args.board_ping:
+            ok, msg = board_send(args.uart, args.baud, FRAME_PING, expect="PONG")
+        else:
+            ok, msg = board_send(args.uart, args.baud, FRAME_CONSOLE, expect="CONSOLE")
+        log(msg, "ok" if ok else "err")
+        return 0 if ok else 1
 
     if args.bake_demos:
         bake_demos(args)
@@ -2477,10 +3259,11 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     emit_all(world, args.out, png_scale=args.png_scale,
              gemini_key=args.gemini_key, eleven_key=args.eleven_key,
-             gemini_model=args.gemini_model, voice_id=args.voice)
+             gemini_model=args.gemini_model, voice_id=args.voice,
+             blocks_per_cell=args.blocks_per_cell)
 
-    if args.uart:
-        send_uart(world, args.uart, args.baud)
+    if args.uart and not send_terrain_blob(world.terrain_blob, args.uart, args.baud, loc.label):
+        return 1
 
     log(f"done. files are in {os.path.abspath(args.out)}", "ok")
     return 0

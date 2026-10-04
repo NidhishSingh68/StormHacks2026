@@ -194,6 +194,11 @@ body.is-ready .chrome { opacity: 1; }
   --d: 260ms;
 }
 body.is-ready .hint.is-hidden { opacity: 0; }
+.credit {
+  position: fixed; z-index: 5; left: 16px; bottom: 8px; margin: 0; max-width: calc(100vw - 32px);
+  font-size: 10.5px; line-height: 1.4; color: var(--ink-4); pointer-events: none;
+  --d: 260ms;
+}
 
 .coords {
   position: fixed; z-index: 5; left: 26px; bottom: 26px; width: 250px; height: 16px;
@@ -342,6 +347,9 @@ input[type="range"]::-webkit-slider-thumb { -webkit-appearance: none; width: 16p
 input[type="range"]::-moz-range-thumb { width: 16px; height: 16px; border-radius: 50%; border: 0; background: #fff; box-shadow: 0 0 0 4px rgb(var(--signal-rgb) / 0.14), 0 2px 6px rgb(0 0 0 / 0.45); }
 input[type="range"]:focus-visible { outline-offset: 4px; border-radius: 6px; }
 .actions { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 6px; }
+.upload-status { min-height: 1.4em; margin: 10px 2px 0; font-size: 12px; color: var(--ink-3); }
+.upload-status.is-done { color: var(--signal); }
+.upload-status.is-error { color: #ff9b8f; }
 
 .sources { margin-top: 26px; padding-top: 16px; border-top: 1px solid var(--hair); }
 .sources ul { list-style: none; margin: 10px 0 0; padding: 0; display: grid; gap: 6px; font-size: 11.5px; line-height: 1.45; color: var(--ink-3); }
@@ -432,6 +440,7 @@ input[type="range"]:focus-visible { outline-offset: 4px; border-radius: 6px; }
 </div>
 
 <p class="hint chrome" id="hint">Drag to spin. Click anywhere to explore.</p>
+<p class="credit chrome">Data: Copernicus DEM GLO-30 &amp; ESA WorldCover (ESA), Open-Meteo.com (CC BY 4.0), &copy; OpenStreetMap contributors (ODbL), NASA Blue Marble</p>
 <div class="coords" id="coords" aria-hidden="true"><span class="dot"></span><span id="coordsText"></span></div>
 
 <aside class="panel glass" id="panel" aria-labelledby="pTitle" inert>
@@ -517,30 +526,21 @@ input[type="range"]:focus-visible { outline-offset: 4px; border-radius: 6px; }
       </dl>
     </section>
 
-    <section class="block" aria-labelledby="rgTitle">
-      <div class="block-head"><h3 class="label" id="rgTitle">Regenerate</h3></div>
-      <div class="field">
-        <div class="field-row"><span id="scaleLabel">Scale</span><output id="scaleOut"></output></div>
-        <div class="seg" id="scaleSeg" role="radiogroup" aria-labelledby="scaleLabel"></div>
-      </div>
-      <div class="field">
-        <div class="field-row"><label for="exag">Vertical exaggeration</label><output class="strong" id="exagOut" for="exag">1.0×</output></div>
-        <input type="range" id="exag" min="0.5" max="3" step="0.1" value="1">
-      </div>
+    <section class="block" aria-label="Build and send to the board">
       <div class="actions">
         <button class="btn btn--primary lift" id="regenBtn" type="button" aria-busy="false">
           <svg class="i idle" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.3 5.7"/><path d="M20 4.5V11h-6.5"/></svg>
           <svg class="i spin" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a9 9 0 1 0 9 9"/></svg>
-          Regenerate
+          Generate
         </button>
-        <button class="btn lift" id="dlBtn" type="button" aria-disabled="true">
-          <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v11M7.5 10.5 12 15l4.5-4.5M5 20h14"/></svg>
-          Download data
+        <button class="btn lift" id="uploadBtn" type="button" aria-disabled="true" aria-busy="false">
+          <svg class="i idle" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 20V9M7.5 13.5 12 9l4.5 4.5M5 4h14"/></svg>
+          <svg class="i spin" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a9 9 0 1 0 9 9"/></svg>
+          Upload to board
         </button>
       </div>
+      <p class="upload-status" id="uploadStatus" role="status" aria-live="polite"></p>
     </section>
-
-    <footer class="sources"><h3 class="label">Data sources</h3><ul id="srcList"></ul></footer>
   </div>
 </aside>
 
@@ -753,8 +753,8 @@ const el = {
   lc: $("lcBlock"), lcMeta: $("lcMeta"), lcTrack: $("lcTrack"), lcLegend: $("lcLegend"), lcBar: $("lcBar"),
   pillText: $("pillText"), pillRetry: $("pillRetry"),
   pv: $("pv"), pvImg: $("pvImg"), pvNote: $("pvNote"), pvMeta: $("pvMeta"), stats: $("stats"),
-  seg: $("scaleSeg"), scaleOut: $("scaleOut"), exag: $("exag"), exagOut: $("exagOut"),
-  regen: $("regenBtn"), dl: $("dlBtn"), srcList: $("srcList"), vRange: $("vRange"), sRelief: $("sRelief"), sSpan: $("sSpan"),
+  regen: $("regenBtn"), upload: $("uploadBtn"), uploadStatus: $("uploadStatus"),
+  vRange: $("vRange"), sRelief: $("sRelief"), sSpan: $("sSpan"),
 };
 
 const nums = {
@@ -1671,7 +1671,9 @@ async function loadInstant(sel) {
     (w) => { if (live()) { sel.weather = w; ui.setWeather(sel); } },
     (e) => { if (live() && !isAbort(e)) ui.setWeather(sel); },
   );
-  if (sel.known) runGenerate(sel);
+  // Nothing is built until the user presses Regenerate (that also sends the
+  // world to the game on the board, so it must not happen on every pick).
+  if (sel.known) ui.setIdle(sel);
 
   const keepAbort = (e) => { if (isAbort(e)) throw e; return null; };
   const elevP = getElevation(sel.lat, sel.lon, signal).catch(keepAbort);
@@ -1689,7 +1691,7 @@ async function loadInstant(sel) {
   ui.setElevation(sel);
   announce([sel.name || formatLatLon(sel.lat, sel.lon), sel.region, sel.country].filter(Boolean).join(", "));
   if (sel.ocean) ui.setOcean();
-  else if (!sel.known) runGenerate(sel);
+  else if (!sel.known) ui.setIdle(sel);
 }
 
 async function runGenerate(sel, { manual = false } = {}) {
@@ -1698,7 +1700,7 @@ async function runGenerate(sel, { manual = false } = {}) {
   sel.genCtl = null;
   const key = genKey(sel);
   const hit = cache.gen.get(key);
-  if (hit) { applyGen(sel, hit, key); return; }
+  if (hit && !manual) { applyGen(sel, hit, key); return; }
   if (!manual && engine.state === "offline" && performance.now() - engine.at < 15000) {
     ui.setEngine(sel, "offline");
     el.regen.setAttribute("aria-busy", "false");
@@ -1710,6 +1712,7 @@ async function runGenerate(sel, { manual = false } = {}) {
   sel.ctl.signal.addEventListener("abort", stop, { once: true });
   el.lc.classList.remove("has-pill");
   ui.setPending(true);
+  setUpload("none");
   el.regen.setAttribute("aria-busy", "true");
   try {
     const entry = await requestGenerate(sel, { scale: state.scale, exaggeration: state.exaggeration }, ctl.signal);
@@ -1739,8 +1742,7 @@ function applyGen(sel, entry, key) {
   ui.setLandCover(d?.stats?.block_percent || {}, d);
   ui.setPreview(sel, entry.preview, d);
   ui.setStats(d);
-  ui.setSources(d);
-  el.dl.setAttribute("aria-disabled", "false");
+  setUpload(d?.upload_id ? "ready" : "none");
   if (!sel.weather && d?.weather?.source === "open-meteo") { sel.weather = fromBackendWeather(d.weather); ui.setWeather(sel); }
   if (!sel.name && d?.location?.name && !/^-?\d/.test(d.location.name)) { sel.name = d.location.name; ui.setPlace(sel); }
   paramsChanged();
@@ -1775,10 +1777,9 @@ const ui = {
     el.stats.classList.add("is-loading");
     el.sRelief.classList.remove("is-na");
     el.sSpan.classList.remove("is-na");
-    el.dl.setAttribute("aria-disabled", "true");
+    setUpload("none");
     el.regen.setAttribute("aria-busy", "false");
     el.regen.classList.remove("is-dirty");
-    this.setSources(null);
     el.pBody.scrollTop = 0;
   },
 
@@ -1876,6 +1877,20 @@ const ui = {
     el.lc.classList.remove("is-ocean", "has-pill");
   },
 
+  setIdle(sel) {
+    if (state.sel !== sel) return;
+    el.lc.classList.remove("has-pill", "is-pending", "is-ocean");
+    el.lcMeta.textContent = "Not built yet";
+    el.pv.classList.remove("is-loading", "is-ocean");
+    el.pv.classList.add("has-note");
+    el.pvNote.textContent = "Press Generate to build this place, then Upload to send it to the game.";
+    this.setStat("relief", null);
+    this.setStat("span", null);
+    el.vRange.textContent = "—";
+    el.stats.classList.remove("is-loading");
+    paramsChanged();
+  },
+
   setOcean() {
     el.lc.classList.add("is-ocean");
     el.lc.classList.remove("has-pill", "is-pending");
@@ -1887,7 +1902,7 @@ const ui = {
     el.lcMeta.textContent = "Open water";
     el.pv.classList.remove("is-loading");
     el.pv.classList.add("is-ocean", "has-note");
-    el.pvNote.textContent = "Open water, nothing to build here. Press Regenerate to make an ocean world anyway.";
+    el.pvNote.textContent = "Open water, nothing to build here. Press Generate to make an ocean world anyway.";
     this.setStat("relief", null);
     this.setStat("span", null);
     el.vRange.textContent = "—";
@@ -1948,20 +1963,6 @@ const ui = {
     el.stats.classList.remove("is-loading");
   },
 
-  setSources(d) {
-    const items = Array.isArray(d?.attribution) ? d.attribution.map(String) : [];
-    items.push(
-      "Live weather and point elevation: Open-Meteo.com (CC BY 4.0)",
-      "Place names: © OpenStreetMap contributors (ODbL), Open-Meteo geocoding",
-      "Globe imagery: NASA Blue Marble and Black Marble",
-    );
-    const list = [...new Set(items)];
-    while (el.srcList.children.length < list.length) el.srcList.append(document.createElement("li"));
-    Array.from(el.srcList.children).forEach((li, i) => {
-      li.hidden = i >= list.length;
-      if (i < list.length && li.textContent !== list[i]) li.textContent = list[i];
-    });
-  },
 };
 
 const announce = (msg) => { el.announce.textContent = msg; };
@@ -2035,72 +2036,54 @@ function onSheetUp(e) {
 }
 
 /* Regenerate controls */
-function renderScaleButtons() {
-  const values = [...new Set([...CONFIG.scales, state.scale])].sort((a, b) => a - b);
-  const thumb = document.createElement("span");
-  thumb.className = "seg-thumb";
-  thumb.setAttribute("aria-hidden", "true");
-  const buttons = values.map((v) => {
-    const b = document.createElement("button");
-    b.type = "button";
-    b.setAttribute("role", "radio");
-    b.dataset.scale = String(v);
-    b.textContent = `${v} m`;
-    return b;
-  });
-  el.seg.replaceChildren(thumb, ...buttons);
-  el.seg.style.setProperty("--n", String(values.length));
-}
-function setScale(v) {
-  state.scale = v;
-  const wanted = new Set([...CONFIG.scales, v]).size;
-  if (el.seg.querySelectorAll("button").length !== wanted || !el.seg.querySelector(`[data-scale="${v}"]`)) renderScaleButtons();
-  el.seg.querySelectorAll("button").forEach((b, i) => {
-    const on = Number(b.dataset.scale) === v;
-    b.setAttribute("aria-checked", String(on));
-    b.tabIndex = on ? 0 : -1;
-    if (on) el.seg.style.setProperty("--i", String(i));
-  });
-  el.scaleOut.textContent = `${formatNumber((v * 128) / 1000, 1)} km across`;
-}
-function setExaggeration(v, fromInput = false) {
-  state.exaggeration = clamp(Math.round(v * 10) / 10, 0.5, 3);
-  if (!fromInput) el.exag.value = String(state.exaggeration);
-  el.exagOut.textContent = `${state.exaggeration.toFixed(1)}×`;
-  el.exag.style.setProperty("--p", `${((state.exaggeration - 0.5) / 2.5) * 100}%`);
-}
+// Scale and exaggeration have no controls any more: generation uses the
+// CONFIG defaults (or a scale that comes with a search result).
+function setScale(v) { state.scale = v; }
+function setExaggeration(v) { state.exaggeration = clamp(Math.round(v * 10) / 10, 0.5, 3); }
 function paramsChanged() {
   const s = state.sel;
-  el.regen.classList.toggle("is-dirty", !!s && !s.ocean && !!s.genKey && s.genKey !== genKey(s));
+  el.regen.classList.toggle("is-dirty", !!s && !s.ocean && (!s.genKey || s.genKey !== genKey(s)));
 }
-function onSegClick(e) {
-  const b = e.target.closest("button[data-scale]");
-  if (!b) return;
-  setScale(Number(b.dataset.scale));
-  paramsChanged();
+/* Upload: send the world built by the last Generate to the game on the board */
+let uploadRun = 0;
+function setUpload(kind, text = "") {
+  // kind: none (nothing built yet), ready, busy, done, error
+  el.upload.setAttribute("aria-disabled", String(kind === "none" || kind === "busy"));
+  el.upload.setAttribute("aria-busy", String(kind === "busy"));
+  el.uploadStatus.classList.toggle("is-done", kind === "done");
+  el.uploadStatus.classList.toggle("is-error", kind === "error");
+  el.uploadStatus.textContent = text;
+  if (kind === "none") uploadRun++;            // forget any upload in flight
 }
-function onSegKey(e) {
-  if (!["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(e.key)) return;
-  e.preventDefault();
-  const bs = [...el.seg.querySelectorAll("button")];
-  const i = bs.findIndex((b) => b.getAttribute("aria-checked") === "true");
-  const j = clamp(i + (e.key === "ArrowLeft" || e.key === "ArrowUp" ? -1 : 1), 0, bs.length - 1);
-  setScale(Number(bs[j].dataset.scale));
-  el.seg.querySelectorAll("button")[j]?.focus();
-  paramsChanged();
-}
-
-function downloadCurrent() {
+async function uploadCurrent() {
   const s = state.sel;
-  if (!s?.gen) return;
-  const url = URL.createObjectURL(new Blob([s.gen.text], { type: "application/json" }));
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = `terra-${slugify(s.name || "location")}-${s.lat.toFixed(3)}_${s.lon.toFixed(3)}.json`;
-  document.body.append(a);
-  a.click();
-  a.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 4000);
+  const id = s?.gen?.data?.upload_id;
+  if (!id) return;
+  const run = ++uploadRun;
+  const live = () => run === uploadRun && state.sel === s;
+  setUpload("busy", "Sending to the board…");
+  try {
+    const res = await fetch(`${API}/upload?id=${encodeURIComponent(id)}`, { cache: "no-store" });
+    if (!res.ok) {
+      let msg = "";
+      try { msg = (await res.json()).error || ""; } catch { /* not JSON */ }
+      if (live()) setUpload("error", msg || `Upload failed (${res.status})`);
+      return;
+    }
+    const t0 = performance.now();
+    while (performance.now() - t0 < 120000) {
+      await new Promise((r) => setTimeout(r, 600));
+      if (!live()) return;
+      const b = await (await fetch(`${API}/board`, { cache: "no-store" })).json();
+      if (String(b.upload_id) !== String(id)) continue;
+      if (b.state === "done") { setUpload("done", "On the board: the game is restarting with this world."); announce("Uploaded to the board"); return; }
+      if (b.state === "failed") { setUpload("error", `The board did not take it: ${b.detail || "no answer"}`); return; }
+      setUpload("busy", b.state === "sending" ? `Sending to the board… ${b.progress ?? 0}%` : "Waiting for the board…");
+    }
+    if (live()) setUpload("error", "No answer from the board.");
+  } catch (e) {
+    if (live()) setUpload("error", "Can't reach the terrain engine (python worldgen.py --serve).");
+  }
 }
 
 let copyTimer = 0;
@@ -2536,10 +2519,7 @@ function bindEvents() {
   el.copyBtn.addEventListener("click", copyCoords);
   el.regen.addEventListener("click", () => { if (state.sel) runGenerate(state.sel, { manual: true }); });
   el.pillRetry.addEventListener("click", () => { if (state.sel) runGenerate(state.sel, { manual: true }); });
-  el.dl.addEventListener("click", downloadCurrent);
-  el.seg.addEventListener("click", onSegClick);
-  el.seg.addEventListener("keydown", onSegKey);
-  el.exag.addEventListener("input", () => { setExaggeration(parseFloat(el.exag.value), true); paramsChanged(); });
+  el.upload.addEventListener("click", uploadCurrent);
   el.panel.addEventListener("transitionend", (e) => { if (e.target === el.panel && e.propertyName === "transform") el.panel.classList.remove("is-animating"); });
   el.grabber.addEventListener("pointerdown", onSheetDown);
   el.pHead.addEventListener("pointerdown", onSheetDown);
@@ -2558,7 +2538,6 @@ async function boot() {
   bindEvents();
   setScale(CONFIG.defaultScale);
   setExaggeration(CONFIG.defaultExaggeration);
-  ui.setSources(null);
   if (touchQuery.matches) el.hint.textContent = "Drag to spin. Tap anywhere to explore.";
   updateSun();
   const home = homeView();

@@ -5,3 +5,4 @@ render
 render.exe
 render_linux
 frame.ppm
+__pycache__/
