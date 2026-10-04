@@ -1,0 +1,21 @@
+# terrad.service - world receiver + game supervisor on the board's serial port
+#
+# Takes /dev/ttyS0 over from the login shell (they cannot share it), runs the
+# game, and swaps in each new world sent by worldgen.py --uart.
+# Login shell back: type "console" + Enter in minicom.
+# terrad back:      sudo systemctl start terrad
+# Off for good:     sudo systemctl disable --now terrad
+
+[Unit]
+Description=Voxel game world receiver (UART) and game supervisor
+After=serial-getty@ttyS0.service
+Conflicts=serial-getty@ttyS0.service
+
+[Service]
+WorkingDirectory=/home/ubuntu
+ExecStart=/home/ubuntu/terrad --tty /dev/ttyS0 --baud 115200 --dir /home/ubuntu --game /home/ubuntu/mc
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
