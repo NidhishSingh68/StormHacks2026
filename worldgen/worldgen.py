@@ -2737,11 +2737,23 @@ def serve(host: str, port: int, out_dir: str, cache_dir: str, defaults) -> None:
                         "/demos": "list of pre-cached demo locations",
                         "/upload": "?id=<upload_id from /generate>: send that world to the board",
                         "/board": "state of the transfer to the board (--uart)",
+                        "/ui": "the web UI (indexnew.html)",
                         "/files/<name>": "download generated files",
                     },
                     "block_types": {str(k): v for k, v in BLOCK_NAMES.items()},
                 }
                 return self._send(200, json.dumps(help_text, indent=2).encode())
+
+            if route == "/ui":
+                # the UI itself, so a browser on another OS (Windows, with the
+                # server in WSL) can open it as http://localhost:PORT/ui
+                page = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                    "indexnew.html")
+                try:
+                    with open(page, "rb") as f:
+                        return self._send(200, f.read(), "text/html; charset=utf-8")
+                except OSError as exc:
+                    return self._send(404, json.dumps({"error": str(exc)}).encode())
 
             if route == "/board":
                 body = pusher.status() if pusher else {"state": "disabled",

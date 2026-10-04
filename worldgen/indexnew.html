@@ -559,7 +559,9 @@ import * as THREE from "three";
 /* =============================================================================
    0. CONFIG  (everything worth tweaking lives here)
    ============================================================================= */
-const API = "http://127.0.0.1:8080"; // worldgen.py --serve
+// worldgen.py --serve: the server this page came from (http://localhost:8080/ui),
+// or the default one when the page is opened as a file
+const API = location.protocol.startsWith("http") ? location.origin : "http://127.0.0.1:8080";
 
 const CONFIG = {
   // Motion
