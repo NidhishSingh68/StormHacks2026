@@ -109,6 +109,7 @@ static int quit;                                /* atomic */
 
 /* stats, written by the worker */
 static int stat_presents, stat_copy_us;
+static int fps_presents;                        /* presents, for the HUD counter */
 
 static double now_ms(void)
 {
@@ -391,6 +392,7 @@ static void *worker_main(void *arg)
                 fpga_present(back[pb]);
                 __atomic_fetch_add(&stat_copy_us, (int)((now_ms() - t0) * 1000), __ATOMIC_RELAXED);
                 __atomic_fetch_add(&stat_presents, 1, __ATOMIC_RELAXED);
+                __atomic_fetch_add(&fps_presents, 1, __ATOMIC_RELAXED);
                 __atomic_store_n(&buf_busy[pb], 0, __ATOMIC_RELEASE);
                 __atomic_store_n(&present_buf, -1, __ATOMIC_RELEASE);
                 armed = 0;
@@ -803,7 +805,7 @@ static int screenshot(const struct camera *cam, const char *path, int breaks, in
         weather = ws.shown;
     }
     for (guard = 0; guard < 20; guard++) {      /* repeat for stable timing */
-        struct view vw = { has_hit ? hit : NULL, eye_in_water(cam), 0, weather, 1.0f };
+        struct view vw = { has_hit ? hit : NULL, eye_in_water(cam), 0, weather, 1.0f, 60 };
         double t2;
 
         t1 = now_ms();
@@ -830,6 +832,8 @@ static void play(int autopilot, int forced_weather)
     float break_timer = 0.0f, place_timer = 0.0f, game_time = 0.0f;
     int cur = 0, stat_frames = 0, prev_f = 0, prev_y = 0, slot = 0;
     struct weather_state ws;
+    double fps_t = 0;               /* FPS counter: last sample time */
+    int fps_shown = -1;             /* -1 until the first sample */
 
     memset(&pl, 0, sizeof(pl));
     find_spawn(pl.feet);
@@ -857,6 +861,15 @@ static void play(int autopilot, int forced_weather)
         if (dt > 0.1f)
             dt = 0.1f;
         game_time += dt;
+
+        /* FPS counter: frames actually shown, averaged over half a second */
+        if (t - fps_t >= 500.0) {
+            int n = __atomic_exchange_n(&fps_presents, 0, __ATOMIC_RELAXED);
+
+            if (fps_t > 0)
+                fps_shown = (int)(n * 1000.0 / (t - fps_t) + 0.5);
+            fps_t = t;
+        }
 
         input_poll(&in);
 
@@ -941,7 +954,7 @@ static void play(int autopilot, int forced_weather)
         w0 = now_ms();
         {
             struct view vw = { has_hit ? hit : NULL, eye_in_water(&pl.cam), slot,
-                               ws.shown, game_time };
+                               ws.shown, game_time, fps_shown };
 
             render_setup(&frame, &pl.cam, &vw);
         }

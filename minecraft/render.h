@@ -40,6 +40,7 @@ struct view {
     int hotbar;                 /* selected hotbar slot */
     int weather;                /* WEATHER_* shown in the corner */
     float time;                 /* seconds, animates rain and snow */
+    int fps;                    /* frames per second shown top right, <0 hides */
 };
 
 /* A raindrop streak (x0,y0)-(x1,y1) or a snowflake at (x0,y0), on screen. */
@@ -92,6 +93,7 @@ struct frame {
     int      sel_valid, sel[3];         /* block under the crosshair */
     int      hotbar;                    /* selected hotbar slot */
     int      weather;
+    int      fps;
     int      npolys, nchunks;
     struct poly polys[MAX_POLYS];
     int      band_count[NUM_BANDS];

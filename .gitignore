@@ -25,3 +25,5 @@ fpga/.qsys_edit/
 /minecraft/terrain_gen
 /minecraft/terrain.bin
 /minecraft/terrain_preview.ppm
+/minecraft/terrad
+/minecraft/terrad_host
