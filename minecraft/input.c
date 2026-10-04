@@ -124,6 +124,8 @@ static int drain(struct input *in, int fd)
                     in->mouse_dx += ev[i].value;
                 else if (ev[i].code == REL_Y)
                     in->mouse_dy += ev[i].value;
+                else if (ev[i].code == REL_WHEEL)
+                    in->wheel += ev[i].value;
             }
         }
     }
@@ -161,6 +163,10 @@ static void poll_terminal(struct input *in)
             case ' ':           in->t_jump = 1; break;
             case 'f': case 'F': in->t_fly = 1;  break;
             case 'b': case 'B': in->t_break = 1; break;
+            case 'p': case 'P': in->t_place = 1; break;
+            case '1': case '2': case '3': case '4': case '5': case '6': case '7':
+                in->t_slot = c - '0';
+                break;
             default: break;
             }
         }

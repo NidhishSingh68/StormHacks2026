@@ -10,8 +10,10 @@
  * An axis-aligned rectangle of block faces, produced by greedy meshing.
  * axis is the face normal (0 = x, 1 = y, 2 = z); the rectangle lies in the
  * plane axis == d and spans [u0, u1) x [v0, v1) along axes (axis + 1) % 3
- * and (axis + 2) % 3. All coordinates are in world blocks.
+ * and (axis + 2) % 3. Coordinates are world positions in half blocks
+ * (QUAD_SCALE units per block), so stairs can have faces mid-block.
  */
+#define QUAD_SCALE      2
 struct quad {
     int32_t d;
     int32_t u0, u1, v0, v1;
@@ -50,6 +52,7 @@ struct chunk {
     uint8_t         nbmask;     /* neighbours that were loaded at mesh time */
     int             ylo, yhi;   /* blocks outside [ylo, yhi) have no faces */
     struct mesh     mesh;       /* owned by the main thread */
+    uint8_t         weather[CHUNK_SIZE][CHUNK_SIZE];            /* [z][x] */
     uint8_t         blocks[CHUNK_H][CHUNK_SIZE][CHUNK_SIZE];    /* [y][z][x] */
 };
 
@@ -72,6 +75,9 @@ struct chunk *world_chunk(int cx, int cz);
 /* Block at world coordinates, or -1 if that chunk isn't loaded. */
 int world_block(int x, int y, int z);
 
+/* Weather over world column (x, z), or -1 if that chunk isn't loaded. */
+int world_weather(int x, int z);
+
 /*
  * Change a block (main thread). Returns a bitmask of chunks that need a new
  * mesh: bit 0 the chunk itself, then NB_* << 1 for neighbours whose faces
@@ -89,11 +95,12 @@ uint8_t world_neighbours(const struct chunk *c);
 int world_ring(const int (**offsets)[2]);
 
 /*
- * First breakable block along a ray (dir need not be normalised), within
- * max_dist. Returns 1 and the block position on a hit.
+ * First targetable block along a ray (dir need not be normalised), within
+ * max_dist. Returns 1 on a hit, with the block in hit and the cell the ray
+ * passed through just before it (where a placed block would go) in prev.
  */
 int world_raycast(const float origin[3], const float dir[3], float max_dist,
-                  int hit[3]);
+                  int hit[3], int prev[3]);
 
 /* Worker-side jobs. */
 void chunk_generate(struct chunk *c);

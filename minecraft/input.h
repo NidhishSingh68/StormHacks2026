@@ -6,7 +6,8 @@
  * terminal the game was started from is read too, so it can be driven over
  * the serial console; a terminal only reports key presses, never releases,
  * so those arrive as one-off nudges instead of held keys (w/a/s/d step,
- * q/e and arrows turn, space jumps, f flies, b breaks; Ctrl-C quits).
+ * q/e and arrows turn, space jumps, f flies, b breaks, p places, 1-7 pick
+ * a block; Ctrl-C quits).
  */
 #ifndef INPUT_H
 #define INPUT_H
@@ -19,13 +20,14 @@ struct input {
     int             kbd_fd, mouse_fd;
     time_t          last_scan;
     unsigned char   key[KEY_CNT];   /* evdev keys currently held */
-    int             mouse_dx, mouse_dy;
+    int             mouse_dx, mouse_dy, wheel;
 
     int             tty;
     struct termios  saved_tio;
     int             saved_flags;
     /* terminal nudges since the last frame */
     int             t_move, t_strafe, t_turn, t_look, t_jump, t_fly, t_break;
+    int             t_place, t_slot;    /* t_slot: 1..7, 0 = none */
 
     int             quit;
 };

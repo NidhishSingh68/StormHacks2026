@@ -110,6 +110,14 @@ int world_block(int x, int y, int z)
     return c->blocks[y][z - cz * CHUNK_SIZE][x - cx * CHUNK_SIZE];
 }
 
+int world_weather(int x, int z)
+{
+    int cx = floor_div(x, CHUNK_SIZE), cz = floor_div(z, CHUNK_SIZE);
+    struct chunk *c = world_chunk(cx, cz);
+
+    return c ? c->weather[z - cz * CHUNK_SIZE][x - cx * CHUNK_SIZE] : -1;
+}
+
 uint8_t world_neighbours(const struct chunk *c)
 {
     uint8_t m = 0;
@@ -151,7 +159,8 @@ int world_set_block(int x, int y, int z, int block)
     return remesh;
 }
 
-int world_raycast(const float o[3], const float d[3], float max_dist, int hit[3])
+int world_raycast(const float o[3], const float d[3], float max_dist,
+                  int hit[3], int prev[3])
 {
     int p[3], step[3], i;
     float tmax[3], tdelta[3], len, t = 0.0f;
@@ -159,6 +168,8 @@ int world_raycast(const float o[3], const float d[3], float max_dist, int hit[3]
     len = sqrtf(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
     if (len < 1e-6f)
         return 0;
+    for (i = 0; i < 3; i++)
+        prev[i] = (int)floorf(o[i]);
 
     for (i = 0; i < 3; i++) {
         float dir = d[i] / len;
@@ -188,6 +199,7 @@ int world_raycast(const float o[3], const float d[3], float max_dist, int hit[3]
             hit[0] = p[0]; hit[1] = p[1]; hit[2] = p[2];
             return 1;
         }
+        prev[0] = p[0]; prev[1] = p[1]; prev[2] = p[2];
         i = (tmax[0] < tmax[1]) ? (tmax[0] < tmax[2] ? 0 : 2)
                                 : (tmax[1] < tmax[2] ? 1 : 2);
         t = tmax[i];
@@ -286,14 +298,16 @@ void chunk_generate(struct chunk *c)
             int top = col->water > col->height ? col->water : col->height;
 
             fill_column(c, x, z, col);
+            c->weather[z][x] = col->weather;
             if (top > c->yhi)
                 c->yhi = top;
         }
     }
 
     /*
-     * Lowest possible face: one below the lowest surface among this chunk's
-     * columns and the neighbouring columns around it.
+     * Lowest possible face: one below the lowest ground among this chunk's
+     * columns and the neighbouring columns around it (lake beds show
+     * through the water).
      */
     for (z = -1; z <= CHUNK_SIZE; z++) {
         for (x = -1; x <= CHUNK_SIZE; x++) {
@@ -301,10 +315,9 @@ void chunk_generate(struct chunk *c)
                 &tiles[(z + TERRAIN_TILE) / TERRAIN_TILE][(x + TERRAIN_TILE) / TERRAIN_TILE]
                       [((z + TERRAIN_TILE) % TERRAIN_TILE) * TERRAIN_TILE +
                        (x + TERRAIN_TILE) % TERRAIN_TILE];
-            int top = col->water > col->height ? col->water : col->height;
 
-            if (top < lo)
-                lo = top;
+            if (col->height < lo)
+                lo = col->height;
         }
     }
     c->ylo = lo > 1 ? lo - 1 : 0;
@@ -338,27 +351,35 @@ struct mesh_ctx {
 };
 
 /*
- * Is the block at chunk-local (x, y, z) air? Coordinates may be one step
- * outside the chunk. Missing neighbours count as filled, so no walls are
- * drawn at the edge of the loaded area. Everything that isn't air (water
- * included) hides the faces behind it: without textures nothing is
- * see-through.
+ * Block at chunk-local (x, y, z); coordinates may be one step outside the
+ * chunk. Missing neighbours count as stone, so no walls are drawn at the
+ * edge of the loaded area; below the world is bedrock, above it air.
  */
-static int air_at(const struct mesh_ctx *m, int x, int y, int z)
+static int block_near(const struct mesh_ctx *m, int x, int y, int z)
 {
     const struct chunk *c = m->c;
 
     if (y < 0)
-        return 0;
+        return BLOCK_BEDROCK;
     if (y >= CHUNK_H)
-        return 1;
+        return BLOCK_AIR;
     if (x < 0)                { c = m->nb[0]; x += CHUNK_SIZE; }
     else if (x >= CHUNK_SIZE) { c = m->nb[1]; x -= CHUNK_SIZE; }
     else if (z < 0)           { c = m->nb[2]; z += CHUNK_SIZE; }
     else if (z >= CHUNK_SIZE) { c = m->nb[3]; z -= CHUNK_SIZE; }
     if (!c)
-        return 0;
-    return c->blocks[y][z][x] == BLOCK_AIR;
+        return BLOCK_STONE;
+    return c->blocks[y][z][x];
+}
+
+/*
+ * Is the face of block b towards neighbour n visible? Yes against air, and
+ * against anything see-through that isn't the same kind of block (so a
+ * lake shows its bed, but no faces are drawn between two water blocks).
+ */
+static inline int face_visible(int b, int n)
+{
+    return n == BLOCK_AIR || (!block_opaque(n) && n != b);
 }
 
 struct quad_list {
@@ -386,17 +407,79 @@ void mesh_free(struct mesh *m)
     memset(m, 0, sizeof(*m));
 }
 
+/*
+ * Faces of the stairs block b at chunk-local (x, y, z), in half blocks:
+ * a bottom slab, plus a step on the raised side. Faces on the block's
+ * outline are dropped where an opaque neighbour hides them.
+ */
+static void stairs_faces(const struct mesh_ctx *m, struct quad_list group[NUM_GROUPS],
+                         int b, int x, int y, int z, const int origin[3])
+{
+    /* box[k] = { lo[3], hi[3] } in half blocks within the cell */
+    int box[2][2][3] = { { { 0, 0, 0 }, { 2, 1, 2 } }, { { 0, 1, 0 }, { 2, 2, 2 } } };
+    int cell[3] = { x, y, z }, k, a, side;
+
+    switch (b) {
+    case BLOCK_STAIRS_XN: box[1][1][0] = 1; break;
+    case BLOCK_STAIRS_XP: box[1][0][0] = 1; break;
+    case BLOCK_STAIRS_ZN: box[1][1][2] = 1; break;
+    default:              box[1][0][2] = 1; break;
+    }
+
+    for (k = 0; k < 2; k++) {
+        for (a = 0; a < 3; a++) {
+            int u = (a + 1) % 3, v = (a + 2) % 3;
+
+            for (side = 0; side < 2; side++) {
+                int plane = box[k][side][a], lo[3], hi[3], i;
+                struct quad q;
+
+                memcpy(lo, box[k][0], sizeof(lo));
+                memcpy(hi, box[k][1], sizeof(hi));
+
+                if (a == 1 && k == 1 && side == 0)
+                    continue;               /* step sits on the slab */
+                if (a == 1 && k == 0 && side == 1) {
+                    /* slab top: only the half the step doesn't cover */
+                    for (i = 0; i < 3; i += 2) {
+                        if (box[1][1][i] == 1) { lo[i] = 1; hi[i] = 2; }
+                        if (box[1][0][i] == 1) { lo[i] = 0; hi[i] = 1; }
+                    }
+                }
+                if (plane == 0 || plane == 2) {
+                    int n[3] = { cell[0], cell[1], cell[2] };
+
+                    n[a] += side ? 1 : -1;
+                    if (block_opaque(block_near(m, n[0], n[1], n[2])))
+                        continue;
+                }
+
+                q.axis = (uint8_t)a;
+                q.side = (uint8_t)side;
+                q.block = (uint8_t)b;
+                q.d  = (origin[a] + cell[a]) * QUAD_SCALE + plane;
+                q.u0 = (origin[u] + cell[u]) * QUAD_SCALE + lo[u];
+                q.u1 = (origin[u] + cell[u]) * QUAD_SCALE + hi[u];
+                q.v0 = (origin[v] + cell[v]) * QUAD_SCALE + lo[v];
+                q.v1 = (origin[v] + cell[v]) * QUAD_SCALE + hi[v];
+                emit(&group[a * 2 + side], &q);
+            }
+        }
+    }
+}
+
 void chunk_mesh(struct chunk *c, struct mesh_result *out)
 {
     static __thread uint8_t mask[CHUNK_H * CHUNK_SIZE];
-    struct quad_list list = { NULL, 0, 0 };
+    struct quad_list list = { NULL, 0, 0 }, stairs[NUM_GROUPS];
     struct mesh_ctx m;
     struct mesh *me = &out->mesh;
     int origin[3] = { c->cx * CHUNK_SIZE, 0, c->cz * CHUNK_SIZE };
     int lo[3] = { 0, c->ylo, 0 }, hi[3] = { CHUNK_SIZE, c->yhi, CHUNK_SIZE };
-    int a, side;
+    int a, side, x, y, z, g;
 
     memset(me, 0, sizeof(*me));
+    memset(stairs, 0, sizeof(stairs));
     m.c = c;
     m.nb[0] = world_chunk(c->cx - 1, c->cz);
     m.nb[1] = world_chunk(c->cx + 1, c->cz);
@@ -411,38 +494,43 @@ void chunk_mesh(struct chunk *c, struct mesh_result *out)
     me->ymin = lo[1];
     me->ymax = hi[1];
 
+    /* stairs aren't cubes: their faces are made separately, per group */
+    for (y = lo[1]; y < hi[1]; y++)
+        for (z = 0; z < CHUNK_SIZE; z++)
+            for (x = 0; x < CHUNK_SIZE; x++)
+                if (block_is_stairs(c->blocks[y][z][x]))
+                    stairs_faces(&m, stairs, c->blocks[y][z][x], x, y, z, origin);
+
     for (a = 0; a < 3; a++) {
         int u = (a + 1) % 3, v = (a + 2) % 3;
         int du = hi[u] - lo[u], dv = hi[v] - lo[v];
 
         for (side = 0; side < 2; side++) {
-            int g = a * 2 + side, step = side ? 1 : -1, d;
+            int step = side ? 1 : -1, d, k;
 
+            g = a * 2 + side;
             me->group_start[g] = list.n;
             me->group_dmin[g] = INT32_MAX;
             me->group_dmax[g] = INT32_MIN;
-            if (du <= 0 || dv <= 0)
-                continue;
 
-            for (d = lo[a]; d < hi[a]; d++) {
+            for (d = lo[a]; d < hi[a] && du > 0 && dv > 0; d++) {
                 int i, j, p[3], any = 0;
 
-                /* which faces in this slice are exposed to air */
+                /* which faces in this slice are visible */
                 for (j = 0; j < dv; j++) {
                     for (i = 0; i < du; i++) {
                         uint8_t b;
 
                         p[a] = d; p[u] = lo[u] + i; p[v] = lo[v] + j;
                         b = c->blocks[p[1]][p[2]][p[0]];
-                        if (b != BLOCK_AIR) {
-                            p[a] += step;
-                            if (air_at(&m, p[0], p[1], p[2])) {
-                                mask[j * du + i] = b;
-                                any = 1;
-                                continue;
-                            }
-                        }
                         mask[j * du + i] = 0;
+                        if (b == BLOCK_AIR || block_is_stairs(b))
+                            continue;
+                        p[a] += step;
+                        if (face_visible(b, block_near(&m, p[0], p[1], p[2]))) {
+                            mask[j * du + i] = b;
+                            any = 1;
+                        }
                     }
                 }
                 if (!any)
@@ -452,7 +540,7 @@ void chunk_mesh(struct chunk *c, struct mesh_result *out)
                 for (j = 0; j < dv; j++) {
                     for (i = 0; i < du; ) {
                         uint8_t b = mask[j * du + i];
-                        int w, h, k, ok;
+                        int w, h, ok;
                         struct quad qd;
 
                         if (!b) {
@@ -477,17 +565,24 @@ void chunk_mesh(struct chunk *c, struct mesh_result *out)
                         qd.axis = (uint8_t)a;
                         qd.side = (uint8_t)side;
                         qd.block = b;
-                        qd.d  = origin[a] + d + side;
-                        qd.u0 = origin[u] + lo[u] + i;
-                        qd.u1 = qd.u0 + w;
-                        qd.v0 = origin[v] + lo[v] + j;
-                        qd.v1 = qd.v0 + h;
+                        qd.d  = (origin[a] + d + side) * QUAD_SCALE;
+                        qd.u0 = (origin[u] + lo[u] + i) * QUAD_SCALE;
+                        qd.u1 = qd.u0 + w * QUAD_SCALE;
+                        qd.v0 = (origin[v] + lo[v] + j) * QUAD_SCALE;
+                        qd.v1 = qd.v0 + h * QUAD_SCALE;
                         emit(&list, &qd);
-                        if (qd.d < me->group_dmin[g]) me->group_dmin[g] = qd.d;
-                        if (qd.d > me->group_dmax[g]) me->group_dmax[g] = qd.d;
                         i += w;
                     }
                 }
+            }
+
+            for (k = 0; k < stairs[g].n; k++)
+                emit(&list, &stairs[g].q[k]);
+            free(stairs[g].q);
+
+            for (k = me->group_start[g]; k < list.n; k++) {
+                if (list.q[k].d < me->group_dmin[g]) me->group_dmin[g] = list.q[k].d;
+                if (list.q[k].d > me->group_dmax[g]) me->group_dmax[g] = list.q[k].d;
             }
         }
     }

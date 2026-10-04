@@ -80,6 +80,8 @@ void terrain_tile(int cx, int cz, struct terrain_column out[TERRAIN_TILE_COLS])
                 if (out[i].water > CHUNK_H - 10) out[i].water = CHUNK_H - 10;
                 if (out[i].surface >= NUM_BLOCK_TYPES || out[i].surface == BLOCK_AIR)
                     out[i].surface = BLOCK_GRASS;
+                if (out[i].weather >= NUM_WEATHERS)
+                    out[i].weather = WEATHER_SUNNY;
             }
             return;
         }
@@ -90,6 +92,8 @@ void terrain_tile(int cx, int cz, struct terrain_column out[TERRAIN_TILE_COLS])
         out[i].water = 0;
         out[i].surface = BLOCK_GRASS;
         out[i].feature = FEATURE_NONE;
+        out[i].weather = WEATHER_SUNNY;
+        out[i].reserved = 0;
     }
 }
 

@@ -80,17 +80,108 @@ static float smoothstep(float a, float b, float x)
     return t * t * (3 - 2 * t);
 }
 
-static int ground_height(int x, int z)
+static int ground_height(int x, int z, int *rock)
 {
-    float continent = fbm(x, z, 1024, 3, seed * 7 + 1);
-    float hills = fbm(x, z, 256, 5, seed * 7 + 2);
-    float ridge = 1.0f - fabsf(fbm(x, z, 512, 4, seed * 7 + 3));
-    float mask = smoothstep(0.05f, 0.45f, fbm(x, z, 1024, 2, seed * 7 + 4));
-    float h = SEA_LEVEL + 6 + continent * 26 + hills * 10 + mask * ridge * ridge * 55;
+    /* land vs water, changing every few hundred blocks */
+    float continent = fbm(x, z, 512, 4, seed * 7 + 1);
+    float hills = fbm(x, z, 128, 4, seed * 7 + 2);
+    /* sharp ridged mountains over about half of the land */
+    float ridge = 1.0f - fabsf(fbm(x, z, 256, 4, seed * 7 + 3));
+    float mask = smoothstep(-0.25f, 0.25f, fbm(x, z, 512, 3, seed * 7 + 4));
+    float mountain = mask * ridge * ridge * ridge * 62;
+    float h = SEA_LEVEL - 1 + continent * 24 + hills * 6 + mountain;
+
+    *rock = (int)mountain;
 
     if (h < 4) h = 4;
     if (h > CHUNK_H - 12) h = CHUNK_H - 12;
     return (int)h;
+}
+
+#define WRAP(v)  ((((v) % N) + N) % N)
+#define AT(x, z) ((size_t)WRAP(z) * N + WRAP(x))
+
+/*
+ * The game spawns near column (0, 0) facing -z. Pick the point of the map
+ * that should become (0, 0): flat open ground right behind a sandy beach,
+ * with the water just past it, and ideally mountains somewhere in view.
+ * The map is then written shifted by that offset (still seamless, since
+ * all noise wraps).
+ */
+static void choose_origin(const uint16_t *height, const uint8_t *surface,
+                          const uint8_t *feature, const uint8_t *weather,
+                          int *ox, int *oz)
+{
+    float best = -1.0f, best_w = 0, best_m = 0, sn[11], cs[11];
+    int cx, cz, i, best_sand = 0;
+
+    for (i = 0; i <= 10; i++) {
+        float a = (-50.0f + 10.0f * i) * (float)M_PI / 180.0f;
+
+        sn[i] = sinf(a);
+        cs[i] = cosf(a);
+    }
+    *ox = *oz = 0;
+
+    for (cz = 0; cz < N; cz += 8) {
+        for (cx = 0; cx < N; cx += 8) {
+            int dx, dz, d, sand = 0, water = 0, wtotal = 0, peaks = 0, ptotal = 0, ok = 1;
+            int h0 = height[AT(cx, cz)];
+            float wf, mf, score;
+
+            /* flat open grass or sand to stand on, above the water */
+            for (dz = -2; dz <= 2 && ok; dz++)
+                for (dx = -2; dx <= 2 && ok; dx++) {
+                    size_t k = AT(cx + dx, cz + dz);
+
+                    if ((surface[k] != BLOCK_GRASS && surface[k] != BLOCK_SAND) ||
+                        feature[k] || abs(height[k] - h0) > 1 || height[k] < SEA_LEVEL + 1 ||
+                        weather[k] != WEATHER_SUNNY)
+                        ok = 0;
+                }
+            if (!ok)
+                continue;
+
+            /* the beach: sand straight ahead, 3..14 blocks out */
+            for (d = 3; d <= 14; d++)
+                if (surface[AT(cx, cz - d)] == BLOCK_SAND && height[AT(cx, cz - d)] >= SEA_LEVEL)
+                    sand++;
+            if (sand < 3)
+                continue;
+
+            /* the water past it, 12..60 blocks ahead */
+            for (d = 12; d <= 60; d += 4)
+                for (i = 2; i <= 8; i++, wtotal++)
+                    if (height[AT(cx + (int)(d * sn[i]), cz - (int)(d * cs[i]))] < SEA_LEVEL)
+                        water++;
+            wf = (float)water / wtotal;
+            if (wf < 0.3f)
+                continue;
+
+            /* mountains anywhere around within view distance: a bonus */
+            for (d = 30; d <= 100; d += 10)
+                for (i = 0; i < 16; i++, ptotal++) {
+                    float a = i * (float)M_PI / 8.0f;
+
+                    if (height[AT(cx + (int)(d * sinf(a)), cz + (int)(d * cosf(a)))] >= 88)
+                        peaks++;
+                }
+            mf = (float)peaks / ptotal;
+
+            score = fminf(wf, 0.7f) + fminf(mf, 0.15f) / 0.15f * 0.6f;
+            if (score > best) {
+                best = score;
+                best_w = wf;
+                best_m = mf;
+                best_sand = sand;
+                *ox = cx;
+                *oz = cz;
+            }
+        }
+    }
+    fprintf(stderr, "origin moved to generated column (%d, %d): beach %d blocks, "
+            "%.0f%% water ahead, %.0f%% peaks around\n", *ox, *oz, best_sand,
+            best_w * 100, best_m * 100);
 }
 
 int main(int argc, char **argv)
@@ -99,9 +190,9 @@ int main(int argc, char **argv)
     struct terrain_header hdr;
     uint16_t *height;
     struct terrain_column *tile;
-    uint8_t *surface, *feature;
+    uint8_t *surface, *feature, *rock, *weather;
     FILE *f;
-    int i, x, z, tx, tz;
+    int i, x, z, tx, tz, ox, oz;
     long trees = 0, water = 0;
 
     for (i = 1; i < argc; i++) {
@@ -122,16 +213,23 @@ int main(int argc, char **argv)
     height = malloc((size_t)N * N * sizeof(*height));
     surface = malloc((size_t)N * N);
     feature = calloc((size_t)N * N, 1);
+    rock = malloc((size_t)N * N);
+    weather = malloc((size_t)N * N);
     tile = malloc(TERRAIN_TILE_BYTES);
-    if (!height || !surface || !feature || !tile) {
+    if (!height || !surface || !feature || !rock || !weather || !tile) {
         fprintf(stderr, "out of memory\n");
         return 1;
     }
 
     fprintf(stderr, "heights...\n");
-    for (z = 0; z < N; z++)
-        for (x = 0; x < N; x++)
-            height[(size_t)z * N + x] = (uint16_t)ground_height(x, z);
+    for (z = 0; z < N; z++) {
+        for (x = 0; x < N; x++) {
+            int r;
+
+            height[(size_t)z * N + x] = (uint16_t)ground_height(x, z, &r);
+            rock[(size_t)z * N + x] = (uint8_t)(r > 255 ? 255 : r);
+        }
+    }
 
     fprintf(stderr, "surfaces...\n");
     for (z = 0; z < N; z++) {
@@ -149,10 +247,36 @@ int main(int argc, char **argv)
             }
             if (h < SEA_LEVEL)              s = (h >= SEA_LEVEL - 5) ? BLOCK_SAND : BLOCK_DIRT;
             else if (h <= SEA_LEVEL + 2)    s = BLOCK_SAND;
-            else if (h > 100)               s = BLOCK_SNOW;
-            else if (h > 86 || slope >= 3)  s = BLOCK_STONE;
+            else if (h > 98)                s = BLOCK_SNOW;
+            else if (h > 74 || slope >= 2 || rock[(size_t)z * N + x] > 10)
+                                            s = BLOCK_STONE;
             else                            s = BLOCK_GRASS;
             surface[(size_t)z * N + x] = s;
+        }
+    }
+
+    /*
+     * Weather: zones a few hundred blocks across from slow noise, and snow
+     * over every mountain area, whose grass turns to snowy ground.
+     */
+    fprintf(stderr, "weather...\n");
+    for (z = 0; z < N; z++) {
+        for (x = 0; x < N; x++) {
+            size_t idx = (size_t)z * N + x;
+            float v = fbm(x, z, 1024, 2, seed * 7 + 6);
+            float night = fbm(x, z, 1024, 2, seed * 7 + 7);
+            uint8_t w;
+
+            if (night > 0.45f)          w = WEATHER_NIGHT;
+            else if (v < -0.35f)        w = WEATHER_RAIN;
+            else if (v < -0.1f)         w = WEATHER_CLOUDY;
+            else                        w = WEATHER_SUNNY;
+            if (rock[idx] > 10 || height[idx] > 84) {
+                w = WEATHER_SNOW;
+                if (surface[idx] == BLOCK_GRASS)
+                    surface[idx] = BLOCK_SNOW;
+            }
+            weather[idx] = w;
         }
     }
 
@@ -163,16 +287,19 @@ int main(int argc, char **argv)
             int px = (x + (int)(hash3(x, z, seed + 11) % 5)) % N;
             int pz = (z + (int)(hash3(x, z, seed + 12) % 5)) % N;
             size_t idx = (size_t)pz * N + px;
-            float density = 0.15f + 0.85f * smoothstep(-0.1f, 0.5f, fbm(px, pz, 256, 3, seed * 7 + 5));
+            /* mostly scattered trees, with the odd grove */
+            float density = 0.04f + 0.5f * smoothstep(0.25f, 0.6f, fbm(px, pz, 256, 3, seed * 7 + 5));
 
             if (surface[idx] != BLOCK_GRASS || height[idx] <= SEA_LEVEL + 2)
                 continue;
-            if (rand01(px, pz, seed + 13) < density * 0.75f) {
+            if (rand01(px, pz, seed + 13) < density * 0.6f) {
                 feature[idx] = FEATURE_TREE;
                 trees++;
             }
         }
     }
+
+    choose_origin(height, surface, feature, weather, &ox, &oz);
 
     f = fopen(out_path, "wb");
     if (!f) {
@@ -203,14 +330,15 @@ int main(int argc, char **argv)
         for (tx = 0; tx < N / TERRAIN_TILE; tx++) {
             for (z = 0; z < TERRAIN_TILE; z++) {
                 for (x = 0; x < TERRAIN_TILE; x++) {
-                    size_t idx = (size_t)(tz * TERRAIN_TILE + z) * N + tx * TERRAIN_TILE + x;
+                    size_t idx = AT(tx * TERRAIN_TILE + x + ox, tz * TERRAIN_TILE + z + oz);
                     struct terrain_column *c = &tile[z * TERRAIN_TILE + x];
 
                     c->height = height[idx];
                     c->water = height[idx] < SEA_LEVEL ? SEA_LEVEL : 0;
                     c->surface = surface[idx];
                     c->feature = feature[idx];
-                    c->reserved[0] = c->reserved[1] = 0;
+                    c->weather = weather[idx];
+                    c->reserved = 0;
                     if (c->water)
                         water++;
                 }
@@ -237,8 +365,8 @@ int main(int argc, char **argv)
         fprintf(p, "P6\n%d %d\n255\n", w, w);
         for (z = 0; z < N; z += 4) {
             for (x = 0; x < N; x += 4) {
-                size_t idx = (size_t)z * N + x;
-                int h = height[idx], hw = height[(size_t)z * N + (x + N - 4) % N];
+                size_t idx = AT(x + ox, z + oz);
+                int h = height[idx], hw = height[AT(x + ox - 4, z + oz)];
                 float shade = 1.0f + 0.08f * (h - hw);
                 float r, g, b;
                 uint8_t px[3];
@@ -250,8 +378,15 @@ int main(int argc, char **argv)
                 case BLOCK_SNOW:  r = 242; g = 246; b = 250; break;
                 default:          r = 95;  g = 159; b = 53;  break;
                 }
-                if (feature[idx] || feature[idx + 1] || feature[idx + 2] || feature[idx + 3]) {
+                if (feature[idx] || feature[AT(x + ox + 1, z + oz)] ||
+                    feature[AT(x + ox + 2, z + oz)] || feature[AT(x + ox + 3, z + oz)]) {
                     r = 40; g = 100; b = 30;
+                }
+                switch (weather[idx]) {     /* tint the map by weather */
+                case WEATHER_NIGHT:  r *= 0.45f; g *= 0.45f; b *= 0.6f; break;
+                case WEATHER_RAIN:   r *= 0.7f;  g *= 0.75f; b *= 0.9f; break;
+                case WEATHER_CLOUDY: r = r * 0.8f + 25; g = g * 0.8f + 25; b = b * 0.8f + 25; break;
+                default: break;
                 }
                 px[0] = (uint8_t)fminf(255, r * shade);
                 px[1] = (uint8_t)fminf(255, g * shade);

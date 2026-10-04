@@ -22,7 +22,9 @@
  *
  * A column record says what the column is made of, not every block in it;
  * the game fills in the layers (surface block, a few blocks of dirt or sand
- * under it, stone, bedrock at y = 0), water, and trees.
+ * under it, stone, bedrock at y = 0), water, and trees. It also carries the
+ * weather over the column, which the game shows while the player stands
+ * there (fading between neighbouring areas).
  */
 #ifndef TERRAIN_H
 #define TERRAIN_H
@@ -36,6 +38,16 @@
 #define TERRAIN_TILE_COLS   (TERRAIN_TILE * TERRAIN_TILE)
 
 enum { FEATURE_NONE = 0, FEATURE_TREE = 1 };
+
+/* Weather over a column. 0 is sunny, so files without weather read as clear. */
+enum {
+    WEATHER_SUNNY = 0,
+    WEATHER_CLOUDY = 1,
+    WEATHER_NIGHT = 2,
+    WEATHER_SNOW = 3,
+    WEATHER_RAIN = 4,
+    NUM_WEATHERS
+};
 
 struct terrain_header {
     char     magic[8];          /* TERRAIN_MAGIC */
@@ -59,7 +71,8 @@ struct terrain_column {
     uint16_t water;             /* blocks height <= y < water are water */
     uint8_t  surface;           /* block id of the top ground block */
     uint8_t  feature;           /* FEATURE_* standing on this column */
-    uint8_t  reserved[2];
+    uint8_t  weather;           /* WEATHER_* over this column */
+    uint8_t  reserved;
 };
 
 #define TERRAIN_TILE_BYTES  (TERRAIN_TILE_COLS * sizeof(struct terrain_column))

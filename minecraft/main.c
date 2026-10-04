@@ -20,16 +20,23 @@
  *   arrows     look around         Ctrl    sprint
  *   mouse      look around         F       toggle flying
  *   B, Enter, left mouse button    break the highlighted block
+ *   P, right mouse button          place the selected block
+ *   1..7, mouse wheel              pick the block to place (hotbar)
+ *   Y          weather: follow the terrain, or force sunny / cloudy /
+ *              night / snow / rain
  *   Esc        quit
  *
  * Usage:
- *   sudo ./mc [--terrain FILE] [--dist N] [--auto]
+ *   sudo ./mc [--terrain FILE] [--dist N] [--weather NAME] [--auto]
  *       --terrain   terrain file (default terrain.bin; flat world if missing)
  *       --dist      render distance in chunks (default 8, max 15)
+ *       --weather   force sunny, cloudy, night, snow or rain (default: the
+ *                   weather stored in the terrain where you stand)
  *       --auto      walk forward and turn slowly on its own
- *   ./mc [--terrain FILE] [--dist N] [--break N] --shot X Y Z YAW PITCH out.ppm
+ *   ./mc [--terrain FILE] [--dist N] [--break N] [--build] --shot X Y Z YAW PITCH out.ppm
  *       render one frame from that eye position (degrees) and save it,
- *       after breaking the block under the crosshair N times
+ *       after breaking the block under the crosshair N times, or placing
+ *       one of each hotbar block in front of the camera (--build)
  */
 
 #define _GNU_SOURCE
@@ -58,7 +65,8 @@
 #define FLY_SPEED       10.9f
 #define SWIM_FACTOR     0.6f
 #define GRAVITY         28.0f
-#define WATER_GRAVITY   4.0f
+#define WATER_GRAVITY   12.0f
+#define WATER_SINK      4.0f        /* max sinking speed, blocks/s */
 #define JUMP_SPEED      8.4f
 #define SWIM_UP_SPEED   3.0f
 #define TURN_SPEED      2.2f        /* rad/s with Q/E or the arrow keys */
@@ -66,7 +74,11 @@
 #define TTY_STEP        1.0f        /* blocks per terminal key press */
 #define TTY_TURN        0.26f       /* rad per terminal turn press */
 #define REACH           5.0f        /* blocks */
-#define BREAK_REPEAT    0.25f       /* s between breaks while held */
+#define BREAK_REPEAT    0.25f       /* s between breaks/places while held */
+
+#define WEATHER_FADE    3.0f        /* s to blend into a new weather */
+#define WEATHER_STEPS   20          /* colour table rebuilds per blend */
+#define WEATHER_SETTLE  0.75f       /* s a new area's weather must persist */
 
 #define JOB_QUEUE       512
 #define JOBS_PER_FRAME  8
@@ -281,20 +293,54 @@ static void schedule_chunks(const float pos[3])
     }
 }
 
-/* main thread: break a block and remesh what it touches */
-static void break_block(const int b[3])
+/* main thread: remesh what a block change at b touched */
+static void remesh_after_edit(const int b[3], int m)
 {
     int cx = floor_div(b[0], CHUNK_SIZE), cz = floor_div(b[2], CHUNK_SIZE);
-    int blk = world_block(b[0], b[1], b[2]), m;
 
-    if (blk <= 0 || blk == BLOCK_BEDROCK || blk == BLOCK_WATER)
-        return;
-    m = world_set_block(b[0], b[1], b[2], BLOCK_AIR);
     if (m & 1)              request_mesh(world_chunk(cx, cz), 1);
     if (m & (NB_XN << 1))   request_mesh(world_chunk(cx - 1, cz), 1);
     if (m & (NB_XP << 1))   request_mesh(world_chunk(cx + 1, cz), 1);
     if (m & (NB_ZN << 1))   request_mesh(world_chunk(cx, cz - 1), 1);
     if (m & (NB_ZP << 1))   request_mesh(world_chunk(cx, cz + 1), 1);
+}
+
+/* main thread: break a block */
+static void break_block(const int b[3])
+{
+    int blk = world_block(b[0], b[1], b[2]);
+
+    if (blk <= 0 || blk == BLOCK_BEDROCK || blk == BLOCK_WATER)
+        return;
+    remesh_after_edit(b, world_set_block(b[0], b[1], b[2], BLOCK_AIR));
+}
+
+/*
+ * main thread: put hotbar block slot into cell c (air or water), facing
+ * stairs away from a player looking along yaw. feet is the player's
+ * position, so nobody gets walled in; NULL to skip that check.
+ */
+static int place_block(const int c[3], int slot, float yaw, const float *feet)
+{
+    int cur = world_block(c[0], c[1], c[2]), b = hotbar_blocks[slot];
+
+    if (cur != BLOCK_AIR && cur != BLOCK_WATER)
+        return 0;
+    if (feet && c[0] + 1 > feet[0] - 0.3f && c[0] < feet[0] + 0.3f &&
+        c[1] + 1 > feet[1] && c[1] < feet[1] + 1.8f &&
+        c[2] + 1 > feet[2] - 0.3f && c[2] < feet[2] + 0.3f)
+        return 0;
+
+    if (block_is_stairs(b)) {
+        float fx = sinf(yaw), fz = -cosf(yaw);
+
+        if (fabsf(fx) > fabsf(fz))
+            b = fx > 0 ? BLOCK_STAIRS_XP : BLOCK_STAIRS_XN;
+        else
+            b = fz > 0 ? BLOCK_STAIRS_ZP : BLOCK_STAIRS_ZN;
+    }
+    remesh_after_edit(c, world_set_block(c[0], c[1], c[2], b));
+    return 1;
 }
 
 /* ---- frame pipeline ------------------------------------------------------ */
@@ -485,8 +531,8 @@ static void update_player(struct player *pl, struct input *in, float dt)
         pl->vy = up * FLY_SPEED;
     } else if (pl->in_water) {
         pl->vy -= WATER_GRAVITY * dt;
-        if (pl->vy < -2.0f)
-            pl->vy = -2.0f;
+        if (pl->vy < -WATER_SINK)
+            pl->vy = -WATER_SINK;
         if (in->key[KEY_SPACE] || in->t_jump)
             pl->vy = SWIM_UP_SPEED;
     } else {
@@ -591,13 +637,105 @@ static void find_spawn(float feet[3])
     feet[2] = 0.5f;
 }
 
+/* ---- weather ------------------------------------------------------------- */
+
+struct weather_state {
+    int shown;                  /* weather being faded to (or shown) */
+    int pending;                /* weather under the player, not yet taken */
+    float pending_t;
+    struct env from, to, cur;   /* cur: what the tables show right now */
+    float t;                    /* 0..1 through the fade */
+    int step;                   /* last table rebuild, in WEATHER_STEPS */
+};
+
+static int parse_weather(const char *name)
+{
+    int w;
+
+    for (w = 0; w < NUM_WEATHERS; w++) {
+        const char *n = weather_name(w);
+        int i;
+
+        for (i = 0; n[i] && (n[i] | 0x20) == (name[i] | 0x20); i++)
+            ;
+        if (!n[i] && !name[i])
+            return w;
+    }
+    return -1;
+}
+
+static void weather_start(struct weather_state *ws, int w)
+{
+    memset(ws, 0, sizeof(*ws));
+    ws->shown = ws->pending = w;
+    env_for_weather(w, &ws->to);
+    ws->from = ws->cur = ws->to;
+    ws->t = 1.0f;
+    ws->step = WEATHER_STEPS;
+    render_set_env(&ws->to);
+}
+
+/*
+ * Follow the wanted weather (forced, or the terrain's under the player).
+ * Fades take WEATHER_FADE seconds; the colour tables are rebuilt only at
+ * WEATHER_STEPS points along the way, as that is the costly part.
+ */
+static void weather_update(struct weather_state *ws, int want, float dt)
+{
+    if (want >= 0 && want != ws->shown) {
+        if (want != ws->pending) {
+            ws->pending = want;
+            ws->pending_t = 0.0f;
+        }
+        ws->pending_t += dt;
+        if (ws->pending_t >= WEATHER_SETTLE) {
+            /* start from whatever is on screen now */
+            ws->from = ws->cur;
+            env_for_weather(want, &ws->to);
+            ws->shown = want;
+            ws->t = 0.0f;
+            ws->step = 0;
+        }
+    } else {
+        ws->pending = ws->shown;
+    }
+
+    if (ws->t < 1.0f) {
+        int step;
+
+        ws->t += dt / WEATHER_FADE;
+        if (ws->t > 1.0f)
+            ws->t = 1.0f;
+        step = (int)(ws->t * WEATHER_STEPS);
+        if (step != ws->step) {
+            float s = (float)step / WEATHER_STEPS;
+
+            env_mix(&ws->cur, &ws->from, &ws->to, s * s * (3.0f - 2.0f * s));
+            render_set_env(&ws->cur);
+            ws->step = step;
+        }
+    }
+}
+
 /* ---- modes --------------------------------------------------------------- */
 
-static int screenshot(const struct camera *cam, const char *path, int breaks)
+static void run_all_jobs(void)
+{
+    int k;
+
+    for (k = 0; k < 2; k++) {
+        while (job_run_one())
+            ;
+        integrate_results();
+    }
+}
+
+static int screenshot(const struct camera *cam, const char *path, int breaks, int build,
+                      int weather)
 {
     float *zbuf = aligned_alloc(64, BAND_H * SCREEN_W * sizeof(float));
     float dir[3];
-    int b, guard, hit[3], has_hit;
+    int b, guard, hit[3], prev[3], has_hit;
     double t0, t1;
 
     /* load everything in range, running the jobs on this thread */
@@ -622,27 +760,54 @@ static int screenshot(const struct camera *cam, const char *path, int breaks)
     t1 = now_ms();
 
     view_dir(cam, dir);
-    has_hit = world_raycast(cam->pos, dir, REACH, hit);
+    has_hit = world_raycast(cam->pos, dir, REACH, hit, prev);
 
     /* test hook: break the targeted block a few times, like holding B */
     for (; breaks > 0 && has_hit; breaks--) {
         printf("breaking block %d %d %d (type %d)\n", hit[0], hit[1], hit[2],
                world_block(hit[0], hit[1], hit[2]));
         break_block(hit);
-        while (job_run_one())
-            ;
-        integrate_results();
-        while (job_run_one())
-            ;
-        integrate_results();
-        has_hit = world_raycast(cam->pos, dir, REACH, hit);
+        run_all_jobs();
+        has_hit = world_raycast(cam->pos, dir, REACH, hit, prev);
     }
 
+    /* test hook: one of each hotbar block on the ground ahead, the glass
+     * and stairs doubled up so their shapes show */
+    if (build) {
+        float fx = sinf(cam->yaw), fz = -cosf(cam->yaw);
+        int i, k;
+
+        for (i = 0; i < HOTBAR_SLOTS; i++) {
+            for (k = 0; k < ((i == 3 || i == 6) ? 2 : 1); k++) {
+                float side = (i - (HOTBAR_SLOTS - 1) * 0.5f) * 1.6f;
+                int c[3], y;
+
+                c[0] = (int)floorf(cam->pos[0] + fx * 8 + fz * -side + (i == 6 ? fx * k : 0));
+                c[2] = (int)floorf(cam->pos[2] + fz * 8 + fx * side + (i == 6 ? fz * k : 0));
+                for (y = CHUNK_H - 1; y > 0 && !block_solid(world_block(c[0], y - 1, c[2])); y--)
+                    ;
+                c[1] = y + (i == 3 ? k : 0);
+                place_block(c, i, cam->yaw, NULL);
+            }
+        }
+        run_all_jobs();
+        has_hit = world_raycast(cam->pos, dir, REACH, hit, prev);
+    }
+
+    {
+        struct weather_state ws;
+        int w = weather >= 0 ? weather
+              : world_weather((int)floorf(cam->pos[0]), (int)floorf(cam->pos[2]));
+
+        weather_start(&ws, w < 0 ? WEATHER_SUNNY : w);
+        weather = ws.shown;
+    }
     for (guard = 0; guard < 20; guard++) {      /* repeat for stable timing */
+        struct view vw = { has_hit ? hit : NULL, eye_in_water(cam), 0, weather, 1.0f };
         double t2;
 
         t1 = now_ms();
-        render_setup(&frame, cam, has_hit ? hit : NULL, eye_in_water(cam));
+        render_setup(&frame, cam, &vw);
         t2 = now_ms();
         for (b = 0; b < NUM_BANDS; b++)
             render_band(&frame, back[0], b, zbuf);
@@ -655,15 +820,16 @@ static int screenshot(const struct camera *cam, const char *path, int breaks)
     return write_ppm(path, back[0]);
 }
 
-static void play(int autopilot)
+static void play(int autopilot, int forced_weather)
 {
     struct player pl;
     struct input in;
     float *zbuf = aligned_alloc(64, BAND_H * SCREEN_W * sizeof(float));
     pthread_t worker;
     double last, stat_t, stat_work = 0;
-    float break_timer = 0.0f;
-    int cur = 0, stat_frames = 0, prev_f = 0;
+    float break_timer = 0.0f, place_timer = 0.0f, game_time = 0.0f;
+    int cur = 0, stat_frames = 0, prev_f = 0, prev_y = 0, slot = 0;
+    struct weather_state ws;
 
     memset(&pl, 0, sizeof(pl));
     find_spawn(pl.feet);
@@ -671,7 +837,9 @@ static void play(int autopilot)
 
     input_open(&in);
     printf("WASD move, Q/E turn, arrows/mouse look, Space jump, Ctrl sprint, F fly,\n"
-           "B/Enter/left click break, Esc quit\n");
+           "B/left click break, P/right click place, 1-7/wheel pick block,\n"
+           "Y cycle weather, Esc quit\n");
+    weather_start(&ws, forced_weather >= 0 ? forced_weather : WEATHER_SUNNY);
     printf("cores online: %ld, spawn %.1f %.1f %.1f\n", sysconf(_SC_NPROCESSORS_ONLN),
            pl.feet[0], pl.feet[1], pl.feet[2]);
     fflush(stdout);
@@ -683,13 +851,23 @@ static void play(int autopilot)
     while (!quitting() && !in.quit) {
         double t = now_ms(), w0;
         float dt = (float)((t - last) / 1000.0), dir[3];
-        int hit[3], has_hit, want_break;
+        int hit[3], prev[3], has_hit, want_break, want_place, k;
 
         last = t;
         if (dt > 0.1f)
             dt = 0.1f;
+        game_time += dt;
 
         input_poll(&in);
+
+        /* Y: follow the terrain's weather -> sunny -> ... -> rain -> follow */
+        if (in.key[KEY_Y] && !prev_y) {
+            forced_weather = forced_weather + 1 >= NUM_WEATHERS ? -1 : forced_weather + 1;
+            printf("weather: %s\n", forced_weather < 0 ? "from terrain"
+                                                        : weather_name(forced_weather));
+            fflush(stdout);
+        }
+        prev_y = in.key[KEY_Y];
         if (autopilot) {
             in.key[KEY_W] = 1;
             pl.cam.yaw += 0.15f * dt;
@@ -703,32 +881,70 @@ static void play(int autopilot)
             break_timer = 0.0f;
             in.t_break = 0;
         }
+        want_place = in.key[KEY_P] || in.key[BTN_RIGHT];
+        if (in.t_place) {
+            want_place = 1;
+            place_timer = 0.0f;
+            in.t_place = 0;
+        }
+
+        /* hotbar: number keys or the mouse wheel */
+        for (k = 0; k < HOTBAR_SLOTS; k++)
+            if (in.key[KEY_1 + k])
+                slot = k;
+        if (in.t_slot) {
+            slot = in.t_slot - 1;
+            in.t_slot = 0;
+        }
+        if (in.wheel) {
+            slot = ((slot - in.wheel) % HOTBAR_SLOTS + HOTBAR_SLOTS) % HOTBAR_SLOTS;
+            in.wheel = 0;
+        }
 
         update_player(&pl, &in, dt);
         integrate_results();
 
-        /* the block under the crosshair, and breaking it */
+        /* the block under the crosshair: break it, or place against it */
         view_dir(&pl.cam, dir);
-        has_hit = world_raycast(pl.cam.pos, dir, REACH, hit);
+        has_hit = world_raycast(pl.cam.pos, dir, REACH, hit, prev);
         if (want_break && has_hit) {
             break_timer -= dt;
             if (break_timer <= 0.0f) {
                 break_block(hit);
                 break_timer = BREAK_REPEAT;
-                has_hit = world_raycast(pl.cam.pos, dir, REACH, hit);
+                has_hit = world_raycast(pl.cam.pos, dir, REACH, hit, prev);
             }
         } else if (!want_break) {
             break_timer = 0.0f;
         }
+        if (want_place && has_hit) {
+            place_timer -= dt;
+            if (place_timer <= 0.0f) {
+                place_block(prev, slot, pl.cam.yaw, pl.feet);
+                place_timer = BREAK_REPEAT;
+                has_hit = world_raycast(pl.cam.pos, dir, REACH, hit, prev);
+            }
+        } else if (!want_place) {
+            place_timer = 0.0f;
+        }
 
         schedule_chunks(pl.cam.pos);
+
+        weather_update(&ws, forced_weather >= 0 ? forced_weather
+                            : world_weather((int)floorf(pl.feet[0]), (int)floorf(pl.feet[2])),
+                       dt);
 
         /* wait until this buffer has been shown */
         while (__atomic_load_n(&buf_busy[cur], __ATOMIC_ACQUIRE) && !quitting())
             sched_yield();
 
         w0 = now_ms();
-        render_setup(&frame, &pl.cam, has_hit ? hit : NULL, eye_in_water(&pl.cam));
+        {
+            struct view vw = { has_hit ? hit : NULL, eye_in_water(&pl.cam), slot,
+                               ws.shown, game_time };
+
+            render_setup(&frame, &pl.cam, &vw);
+        }
         render_frame(cur, zbuf);
         stat_work += now_ms() - w0;
 
@@ -746,10 +962,10 @@ static void play(int autopilot)
             double secs = (t - stat_t) / 1000.0;
 
             printf("%5.1f fps | setup+draw %4.1f ms | copy %4.1f ms | %4d polys %3d chunks"
-                   " | pos %.1f %.1f %.1f%s%s\n",
+                   " | pos %.1f %.1f %.1f | %s%s%s\n",
                    pres / secs, stat_work / stat_frames,
                    pres ? cus / 1000.0 / pres : 0.0, frame.npolys, frame.nchunks,
-                   pl.feet[0], pl.feet[1], pl.feet[2],
+                   pl.feet[0], pl.feet[1], pl.feet[2], weather_name(ws.shown),
                    pl.flying ? " flying" : "", pl.in_water ? " swimming" : "");
             fflush(stdout);
             stat_t = t;
@@ -764,18 +980,52 @@ static void play(int autopilot)
     free(zbuf);
 }
 
+/* test hook: stand at (x, z), hold W for secs, report what happens */
+static void physics_test(float x, float z, float yaw_deg, float secs)
+{
+    struct player pl;
+    struct input in;
+    struct terrain_column col;
+    int i, n = (int)(secs * 60.0f);
+
+    memset(&pl, 0, sizeof(pl));
+    memset(&in, 0, sizeof(in));
+    terrain_column_at((int)floorf(x), (int)floorf(z), &col);
+    pl.feet[0] = x;
+    pl.feet[1] = (float)(col.water > col.height ? col.water : col.height);
+    pl.feet[2] = z;
+    pl.cam.yaw = yaw_deg * (float)M_PI / 180.0f;
+
+    for (i = 0; i < 1000; i++) {            /* load the area */
+        schedule_chunks(pl.feet);
+        while (job_run_one())
+            ;
+        integrate_results();
+    }
+    in.key[KEY_W] = 1;
+    for (i = 0; i <= n; i++) {
+        if (i % 15 == 0)
+            printf("t=%.2fs feet %.2f %.2f %.2f%s%s vy %.1f\n", i / 60.0f,
+                   pl.feet[0], pl.feet[1], pl.feet[2], pl.on_ground ? " ground" : "",
+                   pl.in_water ? " water" : "", pl.vy);
+        update_player(&pl, &in, 1.0f / 60.0f);
+    }
+}
+
 static void usage(void)
 {
     fprintf(stderr,
-            "usage: mc [--terrain FILE] [--dist N] [--auto]\n"
-            "       mc [--terrain FILE] [--dist N] --shot X Y Z YAW PITCH out.ppm\n");
+            "usage: mc [--terrain FILE] [--dist N] [--weather NAME] [--auto]\n"
+            "       mc [--terrain FILE] [--dist N] [--weather NAME] [--break N] [--build]\n"
+            "          --shot X Y Z YAW PITCH out.ppm\n");
 }
 
 int main(int argc, char **argv)
 {
     const char *terrain_path = "terrain.bin", *shot_path = NULL;
     struct camera shot_cam;
-    int dist = RENDER_DIST_DEFAULT, autopilot = 0, breaks = 0, i, rc = 0;
+    int dist = RENDER_DIST_DEFAULT, autopilot = 0, breaks = 0, build = 0, i, rc = 0;
+    int weather = -1;
 
     for (i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--terrain") == 0 && i + 1 < argc) {
@@ -784,6 +1034,22 @@ int main(int argc, char **argv)
             dist = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--break") == 0 && i + 1 < argc) {
             breaks = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--physics") == 0 && i + 4 < argc) {
+            float x = strtof(argv[i + 1], NULL), z = strtof(argv[i + 2], NULL);
+            float yaw = strtof(argv[i + 3], NULL), secs = strtof(argv[i + 4], NULL);
+
+            terrain_open(terrain_path);
+            world_init(dist);
+            physics_test(x, z, yaw, secs);
+            return 0;
+        } else if (strcmp(argv[i], "--weather") == 0 && i + 1 < argc) {
+            weather = parse_weather(argv[++i]);
+            if (weather < 0) {
+                fprintf(stderr, "unknown weather %s\n", argv[i]);
+                return 2;
+            }
+        } else if (strcmp(argv[i], "--build") == 0) {
+            build = 1;
         } else if (strcmp(argv[i], "--auto") == 0) {
             autopilot = 1;
         } else if (strcmp(argv[i], "--shot") == 0 && i + 6 < argc) {
@@ -811,14 +1077,14 @@ int main(int argc, char **argv)
     }
 
     if (shot_path) {
-        rc = screenshot(&shot_cam, shot_path, breaks) ? 1 : 0;
+        rc = screenshot(&shot_cam, shot_path, breaks, build, weather) ? 1 : 0;
     } else {
         if (fpga_open() < 0)
             return 1;
         signal(SIGINT, on_signal);
         signal(SIGTERM, on_signal);
         fpga_pick_copy(back[0]);        /* also clears the screen */
-        play(autopilot);
+        play(autopilot, weather);
         fpga_close();
     }
 
